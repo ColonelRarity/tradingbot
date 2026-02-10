@@ -1198,9 +1198,11 @@ def main():
     os.environ["LOG_LEVEL"] = args.log_level
     init_logging()
     
+    settings = get_settings()
+    mode = "TESTNET" if "testnet" in settings.exchange.base_url.lower() else "PRODUCTION"
     print("=" * 60, flush=True)
     print("Self-Learning Binance USDT-M Futures Trading Bot", flush=True)
-    print("TESTNET ONLY - No Production Trading", flush=True)
+    print(f"{mode} MODE", flush=True)
     print("=" * 60, flush=True)
     
     # Create and start bot
