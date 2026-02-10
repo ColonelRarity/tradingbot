@@ -14,13 +14,50 @@ import time
 import logging
 from functools import wraps
 from typing import Callable, Type, Tuple, Optional, Any
-from binance.exceptions import BinanceAPIException
+
+try:
+    # python-binance (optional dependency in some setups)
+    from binance.exceptions import BinanceAPIException  # type: ignore
+except Exception:
+    class BinanceAPIException(Exception):
+        """Fallback exception type when python-binance is not installed."""
+        pass
+
+try:
+    # binance-futures-connector (used by this project)
+    from binance.error import ClientError  # type: ignore
+except Exception:
+    ClientError = None
 
 from utils.exceptions import (
     APIError, RateLimitError, TimestampError, TradingBotError
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_error_code(exc: Exception) -> Optional[int]:
+    """Extract API error code from different Binance client exception shapes."""
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(exc, "error_code", None)
+    try:
+        return int(code) if code is not None else None
+    except Exception:
+        return None
+
+
+def _extract_retry_after(exc: Exception) -> Optional[float]:
+    """Try to read Retry-After from response headers of API exceptions."""
+    headers = getattr(exc, "response_headers", None)
+    if isinstance(headers, dict):
+        value = headers.get("Retry-After")
+        if value is not None:
+            try:
+                return float(value)
+            except Exception:
+                return None
+    return None
 
 
 def retry_on_error(
@@ -65,13 +102,13 @@ def retry_on_error(
                     if isinstance(e, RateLimitError) and e.retry_after:
                         delay = float(e.retry_after)
                     
-                    # Спеціальна обробка для BinanceAPIException
-                    if isinstance(e, BinanceAPIException):
-                        error_code = getattr(e, 'code', None)
+                    # Спеціальна обробка для Binance API exceptions
+                    if isinstance(e, BinanceAPIException) or (ClientError is not None and isinstance(e, ClientError)):
+                        error_code = _extract_error_code(e)
                         if error_code == 429:  # Rate limit
                             # Спробувати отримати retry_after з headers
-                            retry_after = getattr(e, 'response_headers', {}).get('Retry-After', delay)
-                            delay = float(retry_after) if retry_after else delay
+                            retry_after = _extract_retry_after(e)
+                            delay = retry_after if retry_after is not None else delay
                         elif error_code == -1021:  # Timestamp error
                             # Для timestamp error не робимо backoff, просто retry
                             delay = 0.1
@@ -123,9 +160,11 @@ def retry_on_api_error(
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                except BinanceAPIException as e:
+                except Exception as e:
+                    if not (isinstance(e, BinanceAPIException) or (ClientError is not None and isinstance(e, ClientError))):
+                        raise
                     last_exception = e
-                    error_code = getattr(e, 'code', None)
+                    error_code = _extract_error_code(e)
                     
                     # Перевірити чи можна retry цю помилку
                     if error_code not in retryable_codes:
@@ -140,8 +179,8 @@ def retry_on_api_error(
                     delay = backoff_base ** attempt
                     
                     if error_code == 429:  # Rate limit
-                        retry_after = getattr(e, 'response_headers', {}).get('Retry-After', delay)
-                        delay = float(retry_after) if retry_after else delay
+                        retry_after = _extract_retry_after(e)
+                        delay = retry_after if retry_after is not None else delay
                         logger.warning(
                             f"⚠️ Rate limit exceeded (спроба {attempt + 1}/{max_retries}). "
                             f"Повтор через {delay:.2f}s..."
@@ -156,7 +195,7 @@ def retry_on_api_error(
                         )
                     
                     time.sleep(delay)
-                except Exception as e:
+                except Exception:
                     # Для інших помилок - не retry
                     raise
             
@@ -165,4 +204,3 @@ def retry_on_api_error(
         
         return wrapper
     return decorator
-
