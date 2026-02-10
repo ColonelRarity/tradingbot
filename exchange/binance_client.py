@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 import logging
+import uuid
 from typing import Dict, List, Optional, Any, Literal
 from dataclasses import dataclass
 from enum import Enum
@@ -172,9 +173,9 @@ class RateLimiter:
 
 class BinanceClient:
     """
-    Binance USDT-M Futures Testnet Client.
+    Binance USDT-M Futures Client.
     
-    TESTNET ONLY - No production trading.
+    Defaults to Testnet; production requires explicit opt-in.
     Uses binance-futures-connector UMFutures.
     """
     
@@ -187,9 +188,11 @@ class BinanceClient:
         """
         self.config = config or get_settings().exchange
         
-        # Validate Testnet URL
-        if "testnet" not in self.config.base_url.lower():
-            raise ValueError("BinanceClient MUST use Testnet URL. Production trading disabled.")
+        # Validate production opt-in
+        if "testnet" not in self.config.base_url.lower() and not self.config.allow_production:
+            raise ValueError(
+                "Production URL set but ALLOW_PRODUCTION_TRADING is not enabled."
+            )
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(self.config)
@@ -204,8 +207,26 @@ class BinanceClient:
         # Cache for symbol info
         self._symbol_info: Dict[str, Dict] = {}
         self._exchange_info_loaded = False
+        self._dry_run_order_id = 10_000_000
+        self._dry_run_orders: Dict[int, Order] = {}
         
-        logger.info(f"BinanceClient initialized for Testnet: {self.config.base_url}")
+        mode = "Testnet" if "testnet" in self.config.base_url.lower() else "Production"
+        dry_run_label = " DRY_RUN" if self.config.dry_run else ""
+        logger.info(f"BinanceClient initialized for {mode}{dry_run_label}: {self.config.base_url}")
+
+    def _next_dry_run_order_id(self) -> int:
+        """Generate a unique order ID for dry-run mode."""
+        self._dry_run_order_id += 1
+        return self._dry_run_order_id
+
+    def _record_dry_run_order(self, order: Order) -> None:
+        """Store simulated order for dry-run open order queries."""
+        self._dry_run_orders[order.order_id] = order
+
+    def _clear_dry_run_order(self, order_id: int) -> None:
+        """Remove simulated order."""
+        if order_id in self._dry_run_orders:
+            del self._dry_run_orders[order_id]
     
     def _api_call(self, func, *args, is_order: bool = False, **kwargs) -> Any:
         """
@@ -377,6 +398,28 @@ class BinanceClient:
             params["reduceOnly"] = "true"
         
         logger.debug(f"Placing MARKET order: {side.value} {formatted_qty} {symbol}")
+
+        if self.config.dry_run:
+            price = 0.0
+            try:
+                price = self.get_ticker_price(symbol)
+            except Exception:
+                pass
+            order = Order(
+                order_id=self._next_dry_run_order_id(),
+                client_order_id=f"dry_run_{uuid.uuid4().hex[:10]}",
+                symbol=symbol,
+                side=side.value,
+                order_type="MARKET",
+                status="FILLED",
+                price=price,
+                stop_price=0.0,
+                quantity=float(formatted_qty),
+                executed_qty=float(formatted_qty),
+                time=int(time.time() * 1000)
+            )
+            logger.info(f"[DRY_RUN] MARKET {side.value} {formatted_qty} {symbol} @ {price}")
+            return order
         
         try:
             response = self._api_call(
@@ -437,6 +480,25 @@ class BinanceClient:
             raise ValueError("Either quantity or close_position must be specified")
         
         logger.info(f"Placing STOP_MARKET: {side.value} @ {stop_price} {symbol}")
+
+        if self.config.dry_run:
+            qty_value = float(self._format_quantity(symbol, quantity)) if quantity else 0.0
+            order = Order(
+                order_id=self._next_dry_run_order_id(),
+                client_order_id=f"dry_run_{uuid.uuid4().hex[:10]}",
+                symbol=symbol,
+                side=side.value,
+                order_type="STOP_MARKET",
+                status="NEW",
+                price=0.0,
+                stop_price=stop_price,
+                quantity=qty_value,
+                executed_qty=0.0,
+                time=int(time.time() * 1000)
+            )
+            self._record_dry_run_order(order)
+            logger.info(f"[DRY_RUN] STOP_MARKET {side.value} {symbol} @ {stop_price} qty={qty_value} closePosition={close_position}")
+            return order
         
         response = self._api_call(
             self._client.new_order,
@@ -483,6 +545,25 @@ class BinanceClient:
             raise ValueError("Either quantity or close_position must be specified")
         
         logger.info(f"Placing TAKE_PROFIT_MARKET: {side.value} @ {stop_price} {symbol}")
+
+        if self.config.dry_run:
+            qty_value = float(self._format_quantity(symbol, quantity)) if quantity else 0.0
+            order = Order(
+                order_id=self._next_dry_run_order_id(),
+                client_order_id=f"dry_run_{uuid.uuid4().hex[:10]}",
+                symbol=symbol,
+                side=side.value,
+                order_type="TAKE_PROFIT_MARKET",
+                status="NEW",
+                price=0.0,
+                stop_price=stop_price,
+                quantity=qty_value,
+                executed_qty=0.0,
+                time=int(time.time() * 1000)
+            )
+            self._record_dry_run_order(order)
+            logger.info(f"[DRY_RUN] TAKE_PROFIT_MARKET {side.value} {symbol} @ {stop_price} qty={qty_value} closePosition={close_position}")
+            return order
         
         response = self._api_call(
             self._client.new_order,
@@ -508,6 +589,11 @@ class BinanceClient:
             logger.debug(f"Skipping cancel for invalid order_id: {order_id} (symbol: {symbol})")
             return False
         
+        if self.config.dry_run:
+            self._clear_dry_run_order(order_id)
+            logger.info(f"[DRY_RUN] Cancelled order {order_id} for {symbol}")
+            return True
+
         try:
             self._api_call(
                 self._client.cancel_order,
@@ -545,6 +631,13 @@ class BinanceClient:
         Returns:
             Number of orders cancelled
         """
+        if self.config.dry_run:
+            to_remove = [oid for oid, order in self._dry_run_orders.items() if order.symbol == symbol]
+            for oid in to_remove:
+                self._clear_dry_run_order(oid)
+            logger.info(f"[DRY_RUN] Cancelled {len(to_remove)} orders for {symbol}")
+            return len(to_remove)
+
         try:
             response = self._api_call(
                 self._client.cancel_open_orders,
@@ -569,6 +662,11 @@ class BinanceClient:
         Returns:
             List of open Order objects
         """
+        if self.config.dry_run:
+            if symbol:
+                return [order for order in self._dry_run_orders.values() if order.symbol == symbol]
+            return list(self._dry_run_orders.values())
+
         try:
             if symbol:
                 response = self._api_call(self._client.get_open_orders, symbol=symbol)
@@ -969,6 +1067,12 @@ class BinanceClient:
             self._api_call(self._client.ping)
             return True
         except Exception as e:
+            error_text = str(e)
+            if "restricted location" in error_text.lower() or "eligibility" in error_text.lower():
+                logger.error(
+                    "Connection test failed: Binance blocked this deployment region (HTTP 451 / restricted location). "
+                    "Use a supported hosting region or VPS in an allowed jurisdiction."
+                )
             logger.error(f"Connection test failed: {e}")
             return False
 
