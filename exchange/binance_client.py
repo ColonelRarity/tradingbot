@@ -1067,6 +1067,12 @@ class BinanceClient:
             self._api_call(self._client.ping)
             return True
         except Exception as e:
+            error_text = str(e)
+            if "restricted location" in error_text.lower() or "eligibility" in error_text.lower():
+                logger.error(
+                    "Connection test failed: Binance blocked this deployment region (HTTP 451 / restricted location). "
+                    "Use a supported hosting region or VPS in an allowed jurisdiction."
+                )
             logger.error(f"Connection test failed: {e}")
             return False
 
