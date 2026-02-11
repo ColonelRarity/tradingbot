@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 import logging
 import uuid
-from typing import Dict, List, Optional, Any, Literal
+from typing import Dict, List, Optional, Any, Literal, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
@@ -209,6 +209,8 @@ class BinanceClient:
         self._exchange_info_loaded = False
         self._dry_run_order_id = 10_000_000
         self._dry_run_orders: Dict[int, Order] = {}
+        # symbol -> (net_size, avg_entry_price); net_size > 0 LONG, < 0 SHORT
+        self._dry_run_positions: Dict[str, Tuple[float, float]] = {}
         
         mode = "Testnet" if "testnet" in self.config.base_url.lower() else "Production"
         dry_run_label = " DRY_RUN" if self.config.dry_run else ""
@@ -318,6 +320,42 @@ class BinanceClient:
         Returns:
             List of Position objects (only non-zero positions)
         """
+        if self.config.dry_run:
+            symbols = [symbol] if symbol else list(self._dry_run_positions.keys())
+            positions: List[Position] = []
+            for sym in symbols:
+                if sym not in self._dry_run_positions:
+                    continue
+
+                net_size, entry_price = self._dry_run_positions[sym]
+                if abs(net_size) < 1e-12:
+                    continue
+
+                try:
+                    mark_price = self.get_ticker_price(sym)
+                except Exception:
+                    mark_price = entry_price
+
+                side = "LONG" if net_size > 0 else "SHORT"
+                if net_size > 0:
+                    unrealized_pnl = (mark_price - entry_price) * net_size
+                else:
+                    unrealized_pnl = (entry_price - mark_price) * abs(net_size)
+
+                positions.append(Position(
+                    symbol=sym,
+                    side=side,
+                    size=net_size,
+                    entry_price=entry_price,
+                    mark_price=mark_price,
+                    unrealized_pnl=unrealized_pnl,
+                    leverage=1,
+                    liquidation_price=0.0,
+                    margin_type="CROSSED"
+                ))
+
+            return positions
+
         response = self._api_call(self._client.get_position_risk, symbol=symbol)
         
         positions = []
@@ -400,11 +438,46 @@ class BinanceClient:
         logger.debug(f"Placing MARKET order: {side.value} {formatted_qty} {symbol}")
 
         if self.config.dry_run:
-            price = 0.0
+            price: float
             try:
                 price = self.get_ticker_price(symbol)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"[DRY_RUN] Could not get ticker price for {symbol} to simulate market order: {e}")
+                raise RuntimeError(f"Failed to get price for {symbol} in dry run") from e
+
+            signed_qty = float(formatted_qty) if side == OrderSide.BUY else -float(formatted_qty)
+            if reduce_only:
+                # Reduce-only should only decrease existing exposure
+                current_size, current_entry = self._dry_run_positions.get(symbol, (0.0, price))
+                if current_size > 0 and signed_qty < 0:
+                    new_size = max(0.0, current_size + signed_qty)
+                    if new_size == 0.0:
+                        self._dry_run_positions.pop(symbol, None)
+                    else:
+                        self._dry_run_positions[symbol] = (new_size, current_entry)
+                elif current_size < 0 and signed_qty > 0:
+                    new_size = min(0.0, current_size + signed_qty)
+                    if new_size == 0.0:
+                        self._dry_run_positions.pop(symbol, None)
+                    else:
+                        self._dry_run_positions[symbol] = (new_size, current_entry)
+            else:
+                current_size, current_entry = self._dry_run_positions.get(symbol, (0.0, price))
+                new_size = current_size + signed_qty
+
+                if abs(new_size) < 1e-12:
+                    self._dry_run_positions.pop(symbol, None)
+                elif current_size == 0 or (current_size > 0) != (signed_qty > 0):
+                    # Opening from flat OR direction flip: treat as fresh entry price
+                    self._dry_run_positions[symbol] = (new_size, price)
+                else:
+                    # Same direction scale-in: weighted average entry
+                    weighted_entry = (
+                        (abs(current_size) * current_entry) +
+                        (abs(signed_qty) * price)
+                    ) / abs(new_size)
+                    self._dry_run_positions[symbol] = (new_size, weighted_entry)
+
             order = Order(
                 order_id=self._next_dry_run_order_id(),
                 client_order_id=f"dry_run_{uuid.uuid4().hex[:10]}",

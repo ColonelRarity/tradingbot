@@ -659,8 +659,8 @@ class RiskEngine:
         now = time.time()
         should_warn = (now - self._last_daily_limit_warning) >= self._daily_limit_warning_interval
         
-        # Check trade count
-        if self.daily.trade_count >= self.risk_config.max_trades_per_day:
+        # Check trade count (MAX_TRADES_PER_DAY <= 0 means unlimited)
+        if self.risk_config.max_trades_per_day > 0 and self.daily.trade_count >= self.risk_config.max_trades_per_day:
             if should_warn:
                 logger.warning(f"Daily trade limit reached: {self.daily.trade_count}")
                 self._last_daily_limit_warning = now
@@ -696,6 +696,12 @@ class RiskEngine:
         """Get daily statistics."""
         self.daily.check_date_change()
         
+        max_trades = self.risk_config.max_trades_per_day
+        if max_trades > 0:
+            remaining_trades = max(0, max_trades - self.daily.trade_count)
+        else:
+            remaining_trades = -1
+
         return {
             "date": str(self.daily.date),
             "total_pnl": self.daily.total_pnl,
@@ -705,6 +711,6 @@ class RiskEngine:
             "losing_trades": self.daily.losing_trades,
             "win_rate": self.daily.winning_trades / max(1, self.daily.trade_count),
             "max_drawdown": self.daily.max_drawdown,
-            "remaining_trades": self.risk_config.max_trades_per_day - self.daily.trade_count,
+            "remaining_trades": remaining_trades,
             "remaining_loss_budget": self.risk_config.daily_max_loss_usdt + self.daily.realized_pnl
         }

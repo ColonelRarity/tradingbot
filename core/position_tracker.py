@@ -196,6 +196,14 @@ class PositionTracker:
         Returns:
             TrackedPosition if successful
         """
+        existing_position = self.get_position_for_symbol(symbol)
+        if existing_position:
+            logger.warning(
+                f"[{symbol}] Skipping duplicate open attempt: existing open position "
+                f"{existing_position.position_id} ({existing_position.side})"
+            )
+            return None
+
         position_id = str(uuid.uuid4())[:8]
         
         logger.info(f"Opening position: {position_id} {side} {quantity} {symbol} @ {entry_price}")

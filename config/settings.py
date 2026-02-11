@@ -206,7 +206,9 @@ class RiskConfig:
     daily_profit_target_usdt: float = field(
         default_factory=lambda: _env_float("DAILY_PROFIT_TARGET", 20.0)
     )
-    max_trades_per_day: int = 50
+    max_trades_per_day: int = field(
+        default_factory=lambda: _env_int("MAX_TRADES_PER_DAY", 50)
+    )
     
     # Concurrent positions
     max_concurrent_positions: int = field(
