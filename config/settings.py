@@ -60,16 +60,26 @@ class ExchangeConfig:
     # API Credentials (from environment or fallback to DEMO keys)
     api_key: str = field(default_factory=lambda: os.getenv(
         "BINANCE_FUTURES_API_KEY",
-        os.getenv("BINANCE_DEMO_API_KEY", "iYF1r8aPt04yhYsjAgm9Enhp3QYdPKeSMq9fodbF4Ay6ugYdSPerIwx2Kc86GOUT")
+        os.getenv("BINANCE_DEMO_API_KEY", "")
     ))
     api_secret: str = field(default_factory=lambda: os.getenv(
         "BINANCE_FUTURES_API_SECRET",
-        os.getenv("BINANCE_DEMO_API_SECRET", "htHIv569G42ONqws9EKUJx580WANYQ1fVe9SeSKtpDhlKzTjMqdsy9SyDHQ2yQbb")
+        os.getenv("BINANCE_DEMO_API_SECRET", "")
     ))
     
-    # Testnet endpoints (MANDATORY - no production trading)
-    base_url: str = "https://testnet.binancefuture.com"
-    ws_url: str = "wss://stream.binancefuture.com"
+    # Base endpoints (default to Testnet; production requires explicit opt-in)
+    base_url: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_BASE_URL", "https://testnet.binancefuture.com")
+    )
+    ws_url: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_WS_URL", "wss://stream.binancefuture.com")
+    )
+    allow_production: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_PRODUCTION_TRADING", False)
+    )
+    dry_run: bool = field(
+        default_factory=lambda: _env_bool("DRY_RUN", False)
+    )
     
     # Connection settings
     recv_window: int = 5000
@@ -196,7 +206,9 @@ class RiskConfig:
     daily_profit_target_usdt: float = field(
         default_factory=lambda: _env_float("DAILY_PROFIT_TARGET", 20.0)
     )
-    max_trades_per_day: int = 50
+    max_trades_per_day: int = field(
+        default_factory=lambda: _env_int("MAX_TRADES_PER_DAY", 50)
+    )
     
     # Concurrent positions
     max_concurrent_positions: int = field(
@@ -222,15 +234,25 @@ class StopLossConfig:
     recalc_interval_sec: float = 10.0
     
     # Breakeven trigger - when position reaches this profit, move SL to entry
-    breakeven_trigger_usdt: float = 10.0  # As requested: initial SL/TP at ±10 USDT
-    breakeven_trigger_percent: float = 0.10
+    breakeven_trigger_usdt: float = field(
+        default_factory=lambda: _env_float("SL_BREAKEVEN_TRIGGER_USDT", 10.0)
+    )
+    breakeven_trigger_percent: float = field(
+        default_factory=lambda: _env_float("SL_BREAKEVEN_TRIGGER_PERCENT", 0.10)
+    )
     
     # After breakeven, trail SL to lock in profit
-    trail_activation_profit_usdt: float = 1.0
-    trail_distance_atr_mult: float = 0.8
+    trail_activation_profit_usdt: float = field(
+        default_factory=lambda: _env_float("SL_TRAIL_ACTIVATION_PROFIT_USDT", 1.0)
+    )
+    trail_distance_atr_mult: float = field(
+        default_factory=lambda: _env_float("SL_TRAIL_DISTANCE_ATR_MULT", 0.8)
+    )
     
     # Minimum profit buffer above entry for SL
-    min_profit_buffer_usdt: float = 0.10
+    min_profit_buffer_usdt: float = field(
+        default_factory=lambda: _env_float("SL_MIN_PROFIT_BUFFER_USDT", 0.10)
+    )
     
     # Emergency SL - never let loss exceed this
     emergency_sl_percent: float = 1.0
@@ -325,8 +347,8 @@ class OrderConfig:
 class TelegramConfig:
     """Telegram notifications configuration."""
     
-    enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", True))
-    bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "8576381823:AAFhJfwU62uP26skPRyTrMU-0s3FJYoTeWU"))
+    enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", False))
+    bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
     
     # Notification settings
@@ -383,8 +405,8 @@ class Settings:
             errors.append("BINANCE_FUTURES_API_KEY not set")
         if not self.exchange.api_secret:
             errors.append("BINANCE_FUTURES_API_SECRET not set")
-        if "testnet" not in self.exchange.base_url.lower():
-            errors.append("Exchange URL must be Testnet (contains 'testnet')")
+        if "testnet" not in self.exchange.base_url.lower() and not self.exchange.allow_production:
+            errors.append("Production URL set but ALLOW_PRODUCTION_TRADING is not enabled")
         
         # Risk validation
         if self.risk.max_position_percent <= 0 or self.risk.max_position_percent > 1:

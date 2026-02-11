@@ -152,9 +152,10 @@ class MultiPairTradingBot:
     
     def start(self) -> None:
         """Start the multi-pair trading bot."""
+        mode = "TESTNET" if "testnet" in self.settings.exchange.base_url.lower() else "PRODUCTION"
         print("=" * 60, flush=True)
         print("Starting Multi-Pair Self-Learning Trading Bot", flush=True)
-        print("Mode: TESTNET ONLY", flush=True)
+        print(f"Mode: {mode}", flush=True)
         print(f"Scan interval: {self.settings.market_data.market_scan_interval/3600:.1f} hours", flush=True)
         print(f"Max pairs: {self.settings.market_data.max_pairs_to_scan}", flush=True)
         print("=" * 60, flush=True)
@@ -162,8 +163,7 @@ class MultiPairTradingBot:
         # Test connection
         print("Testing connection...", flush=True)
         if not self.client.test_connection():
-            logger.error("Failed to connect to exchange")
-            return
+            raise RuntimeError("Failed to connect to exchange")
         print("Connection OK!", flush=True)
         
         # Load exchange info
@@ -1198,9 +1198,11 @@ def main():
     os.environ["LOG_LEVEL"] = args.log_level
     init_logging()
     
+    settings = get_settings()
+    mode = "TESTNET" if "testnet" in settings.exchange.base_url.lower() else "PRODUCTION"
     print("=" * 60, flush=True)
     print("Self-Learning Binance USDT-M Futures Trading Bot", flush=True)
-    print("TESTNET ONLY - No Production Trading", flush=True)
+    print(f"{mode} MODE", flush=True)
     print("=" * 60, flush=True)
     
     # Create and start bot

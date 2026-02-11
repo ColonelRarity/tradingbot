@@ -5,18 +5,20 @@ $ErrorActionPreference = "Stop"
 # ----------------------------
 # Заповніть значення і виконайте в PowerShell перед запуском:
 #   .\env.example.ps1
-#   python .\binance_scalper_bot.py
+#   python .\main.py
 #
 # ⚠️ Не комітьте файли з секретами. Цей файл — шаблон (без реальних ключів).
 # Рекомендовано: скопіюйте цей файл в env.local.ps1 і заповніть там (env.local.ps1 ігнорується git).
 
 # --- Binance API keys ---
-$env:BINANCE_SPOT_API_KEY = "your_spot_api_key"
-$env:BINANCE_SPOT_API_SECRET = "your_spot_api_secret"
+$env:BINANCE_FUTURES_API_KEY = "your_futures_api_key"
+$env:BINANCE_FUTURES_API_SECRET = "your_futures_api_secret"
 
-# (опційно) Futures:
-# $env:BINANCE_FUTURES_API_KEY = "your_futures_api_key"
-# $env:BINANCE_FUTURES_API_SECRET = "your_futures_api_secret"
+# --- Production opt-in (be careful) ---
+# За замовчуванням використовується Testnet. Для продакшн потрібно явно увімкнути:
+# $env:BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
+# $env:BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com"
+# $env:ALLOW_PRODUCTION_TRADING = "True"
 
 # (опційно) Demo:
 # $env:BINANCE_DEMO_API_KEY = "your_demo_api_key"
@@ -34,6 +36,9 @@ $env:BINANCE_SPOT_API_SECRET = "your_spot_api_secret"
 $env:TELEGRAM_BOT_TOKEN = ""
 $env:TELEGRAM_ENABLED = "False"
 # $env:TELEGRAM_CHAT_ID = "123456789"
+
+# --- Dry-run (імітація ордерів) ---
+# $env:DRY_RUN = "True"
 
 # --- Self-learning (опційно) ---
 # $env:ENABLE_LEARNING = "True"
@@ -62,5 +67,11 @@ $env:TELEGRAM_ENABLED = "False"
 # Максимальна кількість пар для аналізу (за замовчуванням: 150)
 # На Binance Futures є сотні USDT пар, ви можете збільшити це значення
 # $env:MAX_PAIRS_TO_SCAN = "200"  # Аналізувати топ 200 пар за об'ємом
+# $env:MAX_TRADES_PER_DAY = "0"   # 0 або від'ємне значення = безліміт угод/день
 
-
+# --- SL/TP tuning (опційно) ---
+# $env:SL_BREAKEVEN_TRIGGER_USDT = "10.0"
+# $env:SL_BREAKEVEN_TRIGGER_PERCENT = "0.10"
+# $env:SL_TRAIL_ACTIVATION_PROFIT_USDT = "1.0"
+# $env:SL_TRAIL_DISTANCE_ATR_MULT = "0.8"
+# $env:SL_MIN_PROFIT_BUFFER_USDT = "0.10"
