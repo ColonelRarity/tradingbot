@@ -152,9 +152,10 @@ class MultiPairTradingBot:
     
     def start(self) -> None:
         """Start the multi-pair trading bot."""
+        mode = "TESTNET" if "testnet" in self.settings.exchange.base_url.lower() else "PRODUCTION"
         print("=" * 60, flush=True)
         print("Starting Multi-Pair Self-Learning Trading Bot", flush=True)
-        print("Mode: TESTNET ONLY", flush=True)
+        print(f"Mode: {mode}", flush=True)
         print(f"Scan interval: {self.settings.market_data.market_scan_interval/3600:.1f} hours", flush=True)
         print(f"Max pairs: {self.settings.market_data.max_pairs_to_scan}", flush=True)
         print("=" * 60, flush=True)
@@ -162,8 +163,7 @@ class MultiPairTradingBot:
         # Test connection
         print("Testing connection...", flush=True)
         if not self.client.test_connection():
-            logger.error("Failed to connect to exchange")
-            return
+            raise RuntimeError("Failed to connect to exchange")
         print("Connection OK!", flush=True)
         
         # Load exchange info
@@ -241,7 +241,11 @@ class MultiPairTradingBot:
                     )
 
                     # Add if signal is good enough
-                    if signal.is_valid and signal.direction != SignalDirection.NONE and signal.confidence > 0.2:
+                    if (
+                        signal.is_valid
+                        and signal.direction != SignalDirection.NONE
+                        and signal.confidence >= self.settings.risk.min_entry_confidence
+                    ):
                         new_opportunities.append((symbol, signal.confidence))
                         print(f"DEBUG: Found new opportunity: {symbol} conf={signal.confidence:.3f}", flush=True)
 
@@ -428,7 +432,7 @@ class MultiPairTradingBot:
                         
                         # Only add if signal is valid and confidence is still good
                         # Use a threshold to ensure we only take good opportunities
-                        min_confidence_threshold = 0.15  # Minimum confidence to open position
+                        min_confidence_threshold = self.settings.risk.min_entry_confidence
                         if signal.is_valid and signal.confidence >= min_confidence_threshold:
                             verified_top_symbols.append(symbol)
                             # Update cached confidence with fresh value
@@ -1012,6 +1016,13 @@ class MultiPairTradingBot:
                     logger.debug(f"{symbol} - SKIPPED: Invalid signal or no direction")
                     continue
 
+                if signal.confidence < self.settings.risk.min_entry_confidence:
+                    logger.debug(
+                        f"{symbol} - SKIPPED: Confidence too low "
+                        f"({signal.confidence:.3f} < {self.settings.risk.min_entry_confidence:.3f})"
+                    )
+                    continue
+
                 # FINAL CHECK before opening
                 try:
                     exchange_positions = self.client.get_positions()
@@ -1198,9 +1209,11 @@ def main():
     os.environ["LOG_LEVEL"] = args.log_level
     init_logging()
     
+    settings = get_settings()
+    mode = "TESTNET" if "testnet" in settings.exchange.base_url.lower() else "PRODUCTION"
     print("=" * 60, flush=True)
     print("Self-Learning Binance USDT-M Futures Trading Bot", flush=True)
-    print("TESTNET ONLY - No Production Trading", flush=True)
+    print(f"{mode} MODE", flush=True)
     print("=" * 60, flush=True)
     
     # Create and start bot

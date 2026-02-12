@@ -146,8 +146,8 @@ class PositionTracker:
         # Symbols in blacklist will be skipped when opening new positions
         self._problematic_symbols: Dict[str, float] = {}
         # Use shorter blacklist duration for testnet (1 hour instead of 24)
-        import os
-        if "testnet" in os.getenv("EXCHANGE_BASE_URL", "").lower() or "testnet" in "https://testnet.binancefuture.com":
+        base_url = (self.client.config.base_url if self.client else "").lower()
+        if "testnet" in base_url:
             self._problematic_symbol_duration = 3600.0  # 1 hour for testnet
         else:
             self._problematic_symbol_duration = 86400.0  # 24 hours for production
@@ -196,6 +196,14 @@ class PositionTracker:
         Returns:
             TrackedPosition if successful
         """
+        existing_position = self.get_position_for_symbol(symbol)
+        if existing_position:
+            logger.warning(
+                f"[{symbol}] Skipping duplicate open attempt: existing open position "
+                f"{existing_position.position_id} ({existing_position.side})"
+            )
+            return None
+
         position_id = str(uuid.uuid4())[:8]
         
         logger.info(f"Opening position: {position_id} {side} {quantity} {symbol} @ {entry_price}")
@@ -320,6 +328,9 @@ class PositionTracker:
         # CRITICAL: Verify actual position on exchange immediately after opening
         # This catches cases where the order was filled with wrong side or other issues
         try:
+            if self.client.config.dry_run:
+                logger.info(f"[VERIFY] {symbol}: DRY_RUN enabled, skipping exchange position verification")
+                return position
             time.sleep(0.5)  # Small delay to ensure position is registered on exchange
             exchange_positions = self.client.get_positions(symbol)
             if exchange_positions:
