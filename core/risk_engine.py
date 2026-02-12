@@ -240,11 +240,16 @@ class RiskEngine:
         # Cap at available balance (can't use more than we have)
         position_usdt = min(position_usdt, available_balance * 0.8)  # Reduced from 0.9 to 0.8  # Leave 10% buffer
 
-        # Fixed SL distance of ±10 USDT as requested
-        # Since we want 10 USDT stop loss, the distance depends on position size
-        # We'll calculate it after we have the position size
-        sl_distance = (10.0 / position_usdt) * current_price if position_usdt > 0 else current_price * 0.01
+        # Risk-based SL distance derived from configured max loss per trade
+        # This keeps worst-case loss per trade aligned with MAX_LOSS_PER_TRADE.
+        target_loss_usdt = max(0.1, self.risk_config.max_loss_usdt_per_trade)
+        sl_distance = (target_loss_usdt / position_usdt) * current_price if position_usdt > 0 else current_price * 0.01
         sl_percent = (sl_distance / current_price) * 100
+
+        # Enforce hard max SL distance cap from config (percent units)
+        if sl_percent > self.risk_config.max_sl_percent:
+            sl_percent = self.risk_config.max_sl_percent
+            sl_distance = current_price * (sl_percent / 100)
         
         # Validate current price (must be positive and reasonable)
         MIN_PRICE = 0.0001  # Minimum reasonable price (adjust if needed)
@@ -288,10 +293,6 @@ class RiskEngine:
         
         # Note: Final quantity validation is handled by _format_quantity in binance_client.py
         # which uses the real max_qty from exchange info and handles step_size rounding.
-        
-        # With fixed 10 USDT SL, ensure it's wide enough for hedge to trigger at -7 USDT
-        # Since hedge triggers at -7 USDT and SL is at -10 USDT, this should be fine
-        # No adjustment needed as 10 USDT > 7 USDT required for hedge
         
         # Calculate SL price
         if side == "LONG":

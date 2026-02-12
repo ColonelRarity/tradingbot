@@ -68,6 +68,7 @@ $env:TELEGRAM_ENABLED = "False"
 # На Binance Futures є сотні USDT пар, ви можете збільшити це значення
 # $env:MAX_PAIRS_TO_SCAN = "200"  # Аналізувати топ 200 пар за об'ємом
 # $env:MAX_TRADES_PER_DAY = "0"   # 0 або від'ємне значення = безліміт угод/день
+# $env:MIN_ENTRY_CONFIDENCE = "0.18"  # Відсікти слабкі сигнали
 
 # --- SL/TP tuning (опційно) ---
 # $env:SL_BREAKEVEN_TRIGGER_USDT = "10.0"

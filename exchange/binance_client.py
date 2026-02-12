@@ -438,12 +438,11 @@ class BinanceClient:
         logger.debug(f"Placing MARKET order: {side.value} {formatted_qty} {symbol}")
 
         if self.config.dry_run:
-            price: float
+            price = 0.0
             try:
                 price = self.get_ticker_price(symbol)
-            except Exception as e:
-                logger.error(f"[DRY_RUN] Could not get ticker price for {symbol} to simulate market order: {e}")
-                raise RuntimeError(f"Failed to get price for {symbol} in dry run") from e
+            except Exception:
+                pass
 
             signed_qty = float(formatted_qty) if side == OrderSide.BUY else -float(formatted_qty)
             if reduce_only:

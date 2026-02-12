@@ -241,7 +241,11 @@ class MultiPairTradingBot:
                     )
 
                     # Add if signal is good enough
-                    if signal.is_valid and signal.direction != SignalDirection.NONE and signal.confidence > 0.2:
+                    if (
+                        signal.is_valid
+                        and signal.direction != SignalDirection.NONE
+                        and signal.confidence >= self.settings.risk.min_entry_confidence
+                    ):
                         new_opportunities.append((symbol, signal.confidence))
                         print(f"DEBUG: Found new opportunity: {symbol} conf={signal.confidence:.3f}", flush=True)
 
@@ -428,7 +432,7 @@ class MultiPairTradingBot:
                         
                         # Only add if signal is valid and confidence is still good
                         # Use a threshold to ensure we only take good opportunities
-                        min_confidence_threshold = 0.15  # Minimum confidence to open position
+                        min_confidence_threshold = self.settings.risk.min_entry_confidence
                         if signal.is_valid and signal.confidence >= min_confidence_threshold:
                             verified_top_symbols.append(symbol)
                             # Update cached confidence with fresh value
@@ -1010,6 +1014,13 @@ class MultiPairTradingBot:
 
                 if not signal.is_valid or signal.direction == SignalDirection.NONE:
                     logger.debug(f"{symbol} - SKIPPED: Invalid signal or no direction")
+                    continue
+
+                if signal.confidence < self.settings.risk.min_entry_confidence:
+                    logger.debug(
+                        f"{symbol} - SKIPPED: Confidence too low "
+                        f"({signal.confidence:.3f} < {self.settings.risk.min_entry_confidence:.3f})"
+                    )
                     continue
 
                 # FINAL CHECK before opening

@@ -185,6 +185,9 @@ class RiskConfig:
     max_loss_usdt_per_trade: float = field(
         default_factory=lambda: _env_float("MAX_LOSS_PER_TRADE", 2.0)
     )
+    min_entry_confidence: float = field(
+        default_factory=lambda: _env_float("MIN_ENTRY_CONFIDENCE", 0.18)
+    )
     
     # Volatility bands for entry (lowered for testnet testing)
     min_volatility_percent: float = 0.03  # Allow low volatility on testnet
@@ -413,6 +416,8 @@ class Settings:
             errors.append("max_position_percent must be between 0 and 1")
         if self.risk.max_sl_percent <= 0:
             errors.append("max_sl_percent must be positive")
+        if self.risk.min_entry_confidence < 0 or self.risk.min_entry_confidence > 1:
+            errors.append("min_entry_confidence must be between 0 and 1")
         
         # ML validation
         if self.ml.min_confidence_for_entry < 0 or self.ml.min_confidence_for_entry > 1:
