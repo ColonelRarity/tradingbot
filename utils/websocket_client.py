@@ -4,6 +4,7 @@ WebSocket клієнт для Binance Futures Testnet
 """
 
 import json
+import os
 import threading
 import time
 import logging
@@ -11,6 +12,8 @@ from typing import Dict, Callable, Optional, List
 from collections import defaultdict
 import websocket
 from datetime import datetime
+
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +41,22 @@ class BinanceWebSocketClient:
         self.testnet = testnet
         self.api_key = api_key
         self.api_secret = api_secret
-        
-        # Базові URL
+
+        ex = get_settings().exchange
+        # Combined market streams: prefix must end before "?streams=" (e.g. .../stream).
         if testnet:
-            self.base_url = "wss://stream.binancefuture.com"
-            self.user_data_url = "wss://stream.binancefuture.com"
+            self._combined_prefix = ex.ws_stream_combined_prefix.rstrip("/")
+            self._user_listen_prefix = ex.ws_user_listen_prefix.rstrip("/")
         else:
-            self.base_url = "wss://fstream.binance.com"
-            self.user_data_url = "wss://fstream.binance.com"
+            # Live USD-M (2026+): override via env to routed URL, e.g. wss://fstream.binance.com/market/stream
+            self._combined_prefix = os.getenv(
+                "BINANCE_FUTURES_WS_STREAM_PREFIX",
+                "wss://fstream.binance.com/market/stream",
+            ).rstrip("/")
+            self._user_listen_prefix = os.getenv(
+                "BINANCE_FUTURES_WS_USER_PREFIX",
+                "wss://fstream.binance.com/ws",
+            ).rstrip("/")
         
         # WebSocket з'єднання
         self.ws = None
@@ -375,7 +386,7 @@ class BinanceWebSocketClient:
             except:
                 pass
         
-        url = f"{self.user_data_url}/ws/{self.listen_key}"
+        url = f"{self._user_listen_prefix}/{self.listen_key}"
         
         def on_message(ws, message):
             self._on_message(ws, message)
@@ -443,7 +454,7 @@ class BinanceWebSocketClient:
             # Правильний формат для combined streams: stream1/stream2/stream3
             # Binance приймає формат: wss://stream.binancefuture.com/stream?streams=stream1/stream2/stream3
             stream_url = "/".join(batch)
-            url = f"{self.base_url}/stream?streams={stream_url}"
+            url = f"{self._combined_prefix}?streams={stream_url}"
             logger.debug(f"📡 Підключення до WebSocket: {len(batch)} потоків")
             
             def on_message(ws, message):

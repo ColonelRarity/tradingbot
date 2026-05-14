@@ -25,6 +25,7 @@ def verify_imports():
         ("ml.model", "ML Models"),
         ("ml.trainer", "Model Trainer"),
         ("ml.inference", "Model Inference"),
+        ("utils.websocket_client", "WebSocket Client"),
     ]
     
     success = 0
@@ -93,7 +94,8 @@ def verify_imports():
         print("[OK] All checks passed! Bot is ready to run.")
         print()
         print("To start the bot:")
-        print("  python main.py --symbol BTCUSDT")
+        print("  python main.py")
+        print("  python main.py --log-level DEBUG")
         print()
         print("Make sure to set environment variables:")
         print("  BINANCE_FUTURES_API_KEY=<your_testnet_key>")

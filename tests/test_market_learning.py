@@ -1,18 +1,24 @@
 """
-Тести для модуля market_learning.
+Legacy tests for optional `market_learning` module (not shipped in this repo).
 """
 
-import unittest
-import tempfile
 import os
 import sys
+import tempfile
 import time
+import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+pytest.importorskip("market_learning", reason="market_learning is an optional legacy module")
+
 from market_learning import (
-    LearningDB, make_feature_vector, DEFAULT_FEATURE_SPEC,
-    MultiHeadOnlineModels
+    LearningDB,
+    make_feature_vector,
+    DEFAULT_FEATURE_SPEC,
+    MultiHeadOnlineModels,
 )
 
 

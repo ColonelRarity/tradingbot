@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from enum import Enum
 
-from exchange.binance_client import BinanceClient, get_binance_client, Position
+from exchange.binance_client import BinanceClient, get_binance_client, OrderSide, Position
 from core.market_data import MarketData
 from core.risk_engine import RiskEngine, RiskCalculation
 from core.order_manager import OrderManager
@@ -726,14 +726,63 @@ class PositionTracker:
                 logger.debug(f"[{position.symbol}] get_open_orders returned empty (library bug), skipping SL/TP restoration to avoid duplicates")
                 return
         
+        expected_sl_side = "SELL" if position.side == "LONG" else "BUY"
+        expected_tp_side = "SELL" if position.side == "LONG" else "BUY"
+        
+        sl_candidates = [
+            o for o in exchange_orders
+            if o.order_type == "STOP_MARKET" and o.side == expected_sl_side
+        ]
+        tp_candidates = [
+            o for o in exchange_orders
+            if o.order_type == "TAKE_PROFIT_MARKET" and o.side == expected_tp_side
+        ]
+        
         sl_exists = False
+        if sl_candidates:
+            if position.sl_order_id and any(o.order_id == position.sl_order_id for o in sl_candidates):
+                sl_exists = True
+            elif len(sl_candidates) == 1:
+                sl_exists = True
+                lone = sl_candidates[0]
+                if position.sl_order_id != lone.order_id:
+                    logger.debug(
+                        f"[{position.symbol}] Sync SL order id: tracked={position.sl_order_id} → exchange={lone.order_id}"
+                    )
+                position.sl_order_id = lone.order_id
+                position.sl_price = lone.stop_price
+            else:
+                sl_exists = bool(
+                    position.sl_order_id
+                    and any(o.order_id == position.sl_order_id for o in sl_candidates)
+                )
+                if not sl_exists and position.sl_order_id:
+                    logger.warning(
+                        f"[{position.symbol}] Multiple SL orders on exchange; cannot match tracked id {position.sl_order_id}"
+                    )
+        
         tp_exists = False
-        
-        if position.sl_order_id:
-            sl_exists = any(o.order_id == position.sl_order_id for o in exchange_orders)
-        
-        if position.tp_order_id:
-            tp_exists = any(o.order_id == position.tp_order_id for o in exchange_orders)
+        if tp_candidates:
+            if position.tp_order_id and any(o.order_id == position.tp_order_id for o in tp_candidates):
+                tp_exists = True
+            elif len(tp_candidates) == 1:
+                tp_exists = True
+                lone = tp_candidates[0]
+                if position.tp_order_id != lone.order_id:
+                    logger.debug(
+                        f"[{position.symbol}] Sync TP order id: tracked={position.tp_order_id} → exchange={lone.order_id}"
+                    )
+                position.tp_order_id = lone.order_id
+                position.tp_price = lone.stop_price
+            else:
+                tp_exists = bool(
+                    position.tp_order_id
+                    and any(o.order_id == position.tp_order_id for o in tp_candidates)
+                )
+                if not tp_exists and position.tp_order_id:
+                    logger.warning(
+                        f"[{position.symbol}] Multiple TP orders on exchange; cannot match tracked id {position.tp_order_id}"
+                    )
         
         # Reset error count on successful API call (if we got orders back)
         if len(exchange_orders) > 0:
@@ -875,22 +924,31 @@ class PositionTracker:
 
             # Get current position from exchange to verify closure
             exchange_positions = self.client.get_positions(position.symbol)
-            exchange_pos = exchange_positions[0] if exchange_positions else None
+            matching = [
+                p for p in exchange_positions
+                if p.side == position.side and abs(p.size) > 0.0001
+            ]
+            if matching:
+                exchange_pos = matching[0]
+            else:
+                exchange_pos = exchange_positions[0] if exchange_positions else None
 
             if exchange_pos and abs(exchange_pos.size) > 0.0001:
                 # Position still exists on exchange, force close it
-                close_side = "SELL" if exchange_pos.size > 0 else "BUY"
+                close_side = OrderSide.SELL if exchange_pos.size > 0 else OrderSide.BUY
                 close_quantity = abs(exchange_pos.size)
+                dual = self.client.is_dual_side_position()
 
-                # Use MARKET order with reduceOnly=True for guaranteed full closure
+                # Use MARKET: one-way uses reduceOnly; hedge uses side + positionSide (no reduceOnly)
                 order = self.client.place_market_order(
                     symbol=position.symbol,
                     side=close_side,
                     quantity=close_quantity,
-                    reduce_only=True
+                    reduce_only=True,
+                    position_side=exchange_pos.side if dual else None,
                 )
 
-                logger.info(f"[FULL_CLOSE] {position.symbol}: MARKET close order placed - {close_side} {close_quantity:.6f}")
+                logger.info(f"[FULL_CLOSE] {position.symbol}: MARKET close order placed - {close_side.value} {close_quantity:.6f}")
             else:
                 logger.info(f"[FULL_CLOSE] {position.symbol}: Position already closed on exchange")
 

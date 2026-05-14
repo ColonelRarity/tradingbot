@@ -11,6 +11,7 @@ LRU Cache з TTL (Time To Live) для кешування результатів
 """
 
 import time
+import inspect
 from functools import wraps
 from typing import Any, Callable, Dict, Optional, Tuple
 from collections import OrderedDict
@@ -96,25 +97,25 @@ class TTLCache:
             return len(self._cache)
 
 
-# Глобальні кеші для різних типів даних
-_analysis_cache: Optional[TTLCache] = None
-_price_cache: Optional[TTLCache] = None
+# Глобальні кеші: ключ (тип, ttl, maxsize) — щоб декоратори з різним TTL не змішували записи
+_analysis_caches: Dict[Tuple[str, float, int], TTLCache] = {}
+_price_caches: Dict[Tuple[str, float, int], TTLCache] = {}
 
 
 def get_analysis_cache(ttl: float = 5.0, maxsize: int = 200) -> TTLCache:
-    """Отримати глобальний кеш для аналізу ринку."""
-    global _analysis_cache
-    if _analysis_cache is None:
-        _analysis_cache = TTLCache(maxsize=maxsize, ttl=ttl)
-    return _analysis_cache
+    """Отримати кеш для аналізу ринку (окремий екземпляр на кожну пару ttl/maxsize)."""
+    key = ("analysis", ttl, maxsize)
+    if key not in _analysis_caches:
+        _analysis_caches[key] = TTLCache(maxsize=maxsize, ttl=ttl)
+    return _analysis_caches[key]
 
 
 def get_price_cache(ttl: float = 2.0, maxsize: int = 500) -> TTLCache:
-    """Отримати глобальний кеш для цін."""
-    global _price_cache
-    if _price_cache is None:
-        _price_cache = TTLCache(maxsize=maxsize, ttl=ttl)
-    return _price_cache
+    """Отримати кеш для цін."""
+    key = ("price", ttl, maxsize)
+    if key not in _price_caches:
+        _price_caches[key] = TTLCache(maxsize=maxsize, ttl=ttl)
+    return _price_caches[key]
 
 
 def cached(ttl: float = 5.0, maxsize: int = 128, cache_type: str = "analysis"):
@@ -141,27 +142,34 @@ def cached(ttl: float = 5.0, maxsize: int = 128, cache_type: str = "analysis"):
         
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # Створити ключ кешу з аргументів
-            # Для методів класу перший аргумент (self) ігноруємо
-            if args and hasattr(args[0], '__class__'):
-                # Метод класу - ігноруємо self
-                cache_key = (func.__name__,) + tuple(args[1:]) + tuple(sorted(kwargs.items()))
+            # Ключ кешу: для методів класу відкидаємо лише реальний self (інстанс), не примітиви
+            try:
+                params = list(inspect.signature(func).parameters.keys())
+            except (ValueError, TypeError, OSError):
+                params = []
+
+            if (
+                args
+                and params
+                and params[0] in ("self", "cls")
+                and not isinstance(args[0], (int, float, str, bool, bytes, type(None)))
+            ):
+                cache_key = (id(func), func.__name__) + tuple(args[1:]) + tuple(sorted(kwargs.items()))
             else:
-                # Звичайна функція
-                cache_key = (func.__name__,) + tuple(args) + tuple(sorted(kwargs.items()))
-            
+                cache_key = (id(func), func.__name__) + tuple(args) + tuple(sorted(kwargs.items()))
+
             # Спробувати отримати з кешу
             cached_value = cache.get(cache_key)
             if cached_value is not None:
                 return cached_value
-            
+
             # Виконати функцію
             result = func(*args, **kwargs)
-            
-            # Зберегти результат у кеш (тільки якщо не помилка)
-            if isinstance(result, dict) and 'error' not in result:
+
+            # Не кешувати відповіді з явною помилкою в dict
+            if not (isinstance(result, dict) and "error" in result):
                 cache.set(cache_key, result)
-            
+
             return result
         
         # Додати методи для управління кешем
@@ -175,12 +183,14 @@ def cached(ttl: float = 5.0, maxsize: int = 128, cache_type: str = "analysis"):
 
 
 def clear_all_caches() -> None:
-    """Очистити всі кеші."""
-    global _analysis_cache, _price_cache
-    if _analysis_cache:
-        _analysis_cache.clear()
-    if _price_cache:
-        _price_cache.clear()
+    """Очистити всі кеші та скинути глобальні екземпляри."""
+    global _analysis_caches, _price_caches
+    for c in _analysis_caches.values():
+        c.clear()
+    for c in _price_caches.values():
+        c.clear()
+    _analysis_caches = {}
+    _price_caches = {}
 
 
 def cleanup_all_caches() -> int:
@@ -191,10 +201,9 @@ def cleanup_all_caches() -> int:
         Загальна кількість видалених записів
     """
     total = 0
-    global _analysis_cache, _price_cache
-    if _analysis_cache:
-        total += _analysis_cache.cleanup_expired()
-    if _price_cache:
-        total += _price_cache.cleanup_expired()
+    for c in list(_analysis_caches.values()):
+        total += c.cleanup_expired()
+    for c in list(_price_caches.values()):
+        total += c.cleanup_expired()
     return total
 

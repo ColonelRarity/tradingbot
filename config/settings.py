@@ -69,7 +69,20 @@ class ExchangeConfig:
     
     # Testnet endpoints (MANDATORY - no production trading)
     base_url: str = "https://testnet.binancefuture.com"
+    # Legacy single host (kept for compatibility); prefer ws_stream_combined_prefix / ws_user_listen_prefix below.
     ws_url: str = "wss://stream.binancefuture.com"
+    # USD-M WebSocket (May 2026): production migrates to routed bases (/public, /market, /private) — see Binance
+    # "Important WebSocket Change Notice". Testnet combined streams typically stay on stream.binancefuture.com.
+    # Full URL before "?streams=" for combined market subscriptions (ticker, kline, …).
+    ws_stream_combined_prefix: str = field(default_factory=lambda: os.getenv(
+        "BINANCE_FUTURES_WS_STREAM_PREFIX",
+        "wss://stream.binancefuture.com/stream",
+    ))
+    # User-data stream: prefix before "/<listenKey>" (listenKey appended by client).
+    ws_user_listen_prefix: str = field(default_factory=lambda: os.getenv(
+        "BINANCE_FUTURES_WS_USER_PREFIX",
+        "wss://fstream.binancefuture.com/ws",
+    ))
     
     # Connection settings
     recv_window: int = 5000

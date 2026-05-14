@@ -7,7 +7,7 @@ No Demo API, no python-binance Client.
 Responsibilities:
 - Connection management
 - Rate limiting
-- Order execution (MARKET, STOP_MARKET, TAKE_PROFIT_MARKET)
+- Order execution (MARKET; TP/SL via Algo Order API: STOP_MARKET, TAKE_PROFIT_MARKET)
 - Position queries
 - Account balance
 - Candle data fetching
@@ -83,6 +83,8 @@ class Order:
     quantity: float
     executed_qty: float
     time: int
+    # USD-M Futures: TP/SL are algo orders (algoId); classic orders use orderId
+    is_algo: bool = False
 
 
 @dataclass
@@ -204,8 +206,30 @@ class BinanceClient:
         # Cache for symbol info
         self._symbol_info: Dict[str, Dict] = {}
         self._exchange_info_loaded = False
+        # Cached from GET /fapi/v1/positionSide/dual (None = not fetched yet)
+        self._dual_side_position: Optional[bool] = None
         
         logger.info(f"BinanceClient initialized for Testnet: {self.config.base_url}")
+    
+    def clear_position_mode_cache(self) -> None:
+        """Invalidate dual / one-way mode cache (e.g. after changing position mode on the account)."""
+        self._dual_side_position = None
+    
+    def is_dual_side_position(self) -> bool:
+        """
+        True if the account uses Binance hedge (dual) position mode for USDT-M futures.
+        In that mode, MARKET and conditional orders must include ``positionSide`` (LONG/SHORT).
+        """
+        if self._dual_side_position is not None:
+            return self._dual_side_position
+        try:
+            resp = self._api_call(self._client.get_position_mode, is_order=False)
+            raw = resp.get("dualSidePosition", False)
+            self._dual_side_position = str(raw).lower() == "true"
+        except Exception as e:
+            logger.warning(f"get_position_mode failed, assuming one-way mode: {e}")
+            self._dual_side_position = False
+        return self._dual_side_position
     
     def _api_call(self, func, *args, is_order: bool = False, **kwargs) -> Any:
         """
@@ -259,6 +283,91 @@ class BinanceClient:
             logger.error(f"API ServerError: {e.status_code} - {e.message}")
             raise
     
+    def _sign_request(
+        self,
+        http_method: str,
+        url_path: str,
+        params: Optional[Dict[str, Any]] = None,
+        is_order: bool = False,
+    ) -> Any:
+        """
+        Signed REST call (same signing as UMFutures). Used for Algo Order API paths
+        not wrapped by binance-futures-connector.
+        """
+        self.rate_limiter.wait_if_needed(is_order=is_order)
+        payload = dict(params or {})
+        try:
+            return self._client.sign_request(http_method, url_path, payload)
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error (network/DNS): {e}. Retrying once after 1 second...")
+            time.sleep(1.0)
+            try:
+                return self._client.sign_request(http_method, url_path, payload)
+            except Exception as retry_error:
+                logger.error(f"Connection error retry failed: {retry_error}")
+                raise
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Request timeout: {e}. Retrying once after 0.5 seconds...")
+            time.sleep(0.5)
+            try:
+                return self._client.sign_request(http_method, url_path, payload)
+            except Exception as retry_error:
+                logger.error(f"Timeout retry failed: {retry_error}")
+                raise
+        except ClientError as e:
+            if e.error_code not in [-4046, -2011, -2021, -4028, -4131, -4005]:
+                logger.error(f"API ClientError: {e.error_code} - {e.error_message}")
+            elif e.error_code in [-4131, -4005]:
+                logger.warning(f"API ClientError: {e.error_code} - {e.error_message}")
+            raise
+        except ServerError as e:
+            logger.error(f"API ServerError: {e.status_code} - {e.message}")
+            raise
+    
+    def _place_conditional_algo_order(self, params: Dict[str, Any]) -> Order:
+        """POST /fapi/v1/algoOrder — required for STOP_MARKET / TAKE_PROFIT_MARKET (error -4120 on classic /order)."""
+        response = self._sign_request("POST", "/fapi/v1/algoOrder", params, is_order=True)
+        return self._parse_algo_order_response(response)
+    
+    def _parse_algo_order_response(self, response: Dict[str, Any]) -> Order:
+        """Map New Algo Order or open-algo row to Order (order_id holds algoId)."""
+        trigger = response.get("triggerPrice") or response.get("stopPrice") or "0"
+        qty = response.get("quantity") or "0"
+        return Order(
+            order_id=int(response.get("algoId", 0)),
+            client_order_id=str(response.get("clientAlgoId", "")),
+            symbol=str(response.get("symbol", "")),
+            side=str(response.get("side", "")),
+            order_type=str(response.get("orderType", response.get("type", ""))),
+            status=str(response.get("algoStatus", response.get("status", ""))),
+            price=float(response.get("price") or 0),
+            stop_price=float(trigger),
+            quantity=float(qty),
+            executed_qty=float(response.get("executedQty", 0) or 0),
+            time=int(response.get("createTime", response.get("time", 0)) or 0),
+            is_algo=True,
+        )
+    
+    def _fetch_open_algo_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """GET /fapi/v1/openAlgoOrders — conditional (TP/SL) orders."""
+        params: Dict[str, Any] = {"algoType": "CONDITIONAL"}
+        if symbol:
+            params["symbol"] = symbol
+        raw = self._sign_request("GET", "/fapi/v1/openAlgoOrders", params, is_order=False)
+        if not isinstance(raw, list):
+            return []
+        out: List[Order] = []
+        for row in raw:
+            if not isinstance(row, dict) or not row.get("algoId"):
+                continue
+            try:
+                o = self._parse_algo_order_response(row)
+                if o.order_id > 0:
+                    out.append(o)
+            except Exception:
+                continue
+        return out
+    
     # ==================== Account Methods ====================
     
     def get_account_balance(self) -> AccountBalance:
@@ -305,9 +414,15 @@ class BinanceClient:
             if size == 0:
                 continue  # Skip zero positions
             
+            ps = str(pos.get("positionSide") or "").upper()
+            if ps in ("LONG", "SHORT"):
+                side_str = ps
+            else:
+                side_str = "LONG" if size > 0 else "SHORT"
+            
             positions.append(Position(
                 symbol=pos["symbol"],
-                side="LONG" if size > 0 else "SHORT",
+                side=side_str,
                 size=size,
                 entry_price=float(pos.get("entryPrice", 0)),
                 mark_price=float(pos.get("markPrice", 0)),
@@ -339,7 +454,8 @@ class BinanceClient:
         symbol: str,
         side: OrderSide,
         quantity: float,
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        position_side: Optional[Literal["LONG", "SHORT"]] = None,
     ) -> Order:
         """
         Place MARKET order for entry.
@@ -348,11 +464,13 @@ class BinanceClient:
             symbol: Trading symbol
             side: BUY or SELL
             quantity: Order quantity
-            reduce_only: Whether this is reduce-only
+            reduce_only: Whether this is reduce-only (ignored in dual/hedge mode; use position_side)
+            position_side: LONG or SHORT — required when account is in dual (hedge) position mode
             
         Returns:
             Order object with execution details
         """
+        dual = self.is_dual_side_position()
         # Format and validate quantity (this should already handle max_qty)
         formatted_qty = self._format_quantity(symbol, quantity)
         qty_float = float(formatted_qty)
@@ -373,7 +491,17 @@ class BinanceClient:
             "quantity": formatted_qty,
         }
         
-        if reduce_only:
+        if dual:
+            if position_side not in ("LONG", "SHORT"):
+                raise ValueError(
+                    f"In dual (hedge) position mode, position_side must be LONG or SHORT ({symbol})"
+                )
+            params["positionSide"] = position_side
+            if reduce_only:
+                logger.debug(
+                    "Dual position mode: omitting reduceOnly on MARKET (close via side + positionSide)"
+                )
+        elif reduce_only:
             params["reduceOnly"] = "true"
         
         logger.debug(f"Placing MARKET order: {side.value} {formatted_qty} {symbol}")
@@ -406,10 +534,11 @@ class BinanceClient:
         side: OrderSide,
         stop_price: float,
         quantity: Optional[float] = None,
-        close_position: bool = False
+        close_position: bool = False,
+        position_side: Optional[Literal["LONG", "SHORT"]] = None,
     ) -> Order:
         """
-        Place STOP_MARKET order for Stop Loss.
+        Place STOP_MARKET (conditional) for Stop Loss via Algo Order API.
         
         Args:
             symbol: Trading symbol
@@ -417,34 +546,31 @@ class BinanceClient:
             stop_price: Trigger price for stop
             quantity: Order quantity (optional if close_position=True)
             close_position: Whether to close entire position
+            position_side: LONG/SHORT for Binance hedge mode only (omit in one-way)
             
         Returns:
-            Order object
+            Order object (order_id is algoId; is_algo=True)
         """
-        params = {
+        params: Dict[str, Any] = {
+            "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": side.value,
             "type": "STOP_MARKET",
-            "stopPrice": self._format_price(symbol, stop_price),
+            "triggerPrice": self._format_price(symbol, stop_price),
             "workingType": "MARK_PRICE",
         }
+        if position_side in ("LONG", "SHORT"):
+            params["positionSide"] = position_side
         
         if close_position:
             params["closePosition"] = "true"
-        elif quantity:
+        elif quantity is not None:
             params["quantity"] = self._format_quantity(symbol, quantity)
         else:
             raise ValueError("Either quantity or close_position must be specified")
         
-        logger.info(f"Placing STOP_MARKET: {side.value} @ {stop_price} {symbol}")
-        
-        response = self._api_call(
-            self._client.new_order,
-            is_order=True,
-            **params
-        )
-        
-        return self._parse_order(response)
+        logger.info(f"Placing STOP_MARKET (algo): {side.value} @ {stop_price} {symbol}")
+        return self._place_conditional_algo_order(params)
     
     def place_take_profit_market(
         self,
@@ -452,10 +578,11 @@ class BinanceClient:
         side: OrderSide,
         stop_price: float,
         quantity: Optional[float] = None,
-        close_position: bool = False
+        close_position: bool = False,
+        position_side: Optional[Literal["LONG", "SHORT"]] = None,
     ) -> Order:
         """
-        Place TAKE_PROFIT_MARKET order for Take Profit.
+        Place TAKE_PROFIT_MARKET (conditional) via Algo Order API.
         
         Args:
             symbol: Trading symbol
@@ -463,50 +590,42 @@ class BinanceClient:
             stop_price: Trigger price for take profit
             quantity: Order quantity (optional if close_position=True)
             close_position: Whether to close entire position
+            position_side: LONG/SHORT for Binance hedge mode only
             
         Returns:
-            Order object
+            Order object (order_id is algoId; is_algo=True)
         """
-        params = {
+        params: Dict[str, Any] = {
+            "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": side.value,
             "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": self._format_price(symbol, stop_price),
+            "triggerPrice": self._format_price(symbol, stop_price),
             "workingType": "MARK_PRICE",
         }
+        if position_side in ("LONG", "SHORT"):
+            params["positionSide"] = position_side
         
         if close_position:
             params["closePosition"] = "true"
-        elif quantity:
+        elif quantity is not None:
             params["quantity"] = self._format_quantity(symbol, quantity)
         else:
             raise ValueError("Either quantity or close_position must be specified")
         
-        logger.info(f"Placing TAKE_PROFIT_MARKET: {side.value} @ {stop_price} {symbol}")
-        
-        response = self._api_call(
-            self._client.new_order,
-            is_order=True,
-            **params
-        )
-        
-        return self._parse_order(response)
+        logger.info(f"Placing TAKE_PROFIT_MARKET (algo): {side.value} @ {stop_price} {symbol}")
+        return self._place_conditional_algo_order(params)
     
-    def cancel_order(self, symbol: str, order_id: int) -> bool:
+    def cancel_order(self, symbol: str, order_id: int, is_algo: bool = False) -> bool:
         """
-        Cancel specific order.
-        
-        Args:
-            symbol: Trading symbol
-            order_id: Order ID to cancel
-            
-        Returns:
-            True if cancelled successfully
+        Cancel a classic order (orderId) or conditional algo order (algoId).
         """
-        # Validate order_id before making API call
         if not order_id or order_id <= 0:
             logger.debug(f"Skipping cancel for invalid order_id: {order_id} (symbol: {symbol})")
             return False
+        
+        if is_algo:
+            return self._cancel_algo_order(order_id)
         
         try:
             self._api_call(
@@ -521,8 +640,7 @@ class BinanceClient:
             error_msg = str(e.error_message) if hasattr(e, 'error_message') else str(e)
             # Order not found - this is normal (already filled/cancelled)
             if e.error_code == -2011:
-                return True  # Don't log - it's expected
-            # Handle "orderId is mandatory" error - indicates invalid order_id
+                return True
             if "orderId is mandatory" in error_msg or "orderId is mandatory, but received empty" in error_msg:
                 logger.debug(f"Invalid order_id {order_id} for {symbol} - skipping cancellation")
                 return False
@@ -535,16 +653,35 @@ class BinanceClient:
                 return False
             raise
     
+    def _cancel_algo_order(self, algo_id: int) -> bool:
+        """DELETE /fapi/v1/algoOrder — cancel conditional TP/SL."""
+        if not algo_id or algo_id <= 0:
+            return False
+        try:
+            self._sign_request(
+                "DELETE",
+                "/fapi/v1/algoOrder",
+                {"algoId": algo_id},
+                is_order=True,
+            )
+            logger.debug(f"Cancelled algo order {algo_id}")
+            return True
+        except ClientError as e:
+            if e.error_code == -2011:
+                return True
+            raise
+    
     def cancel_all_orders(self, symbol: str) -> int:
         """
-        Cancel all open orders for symbol.
+        Cancel all open classic orders and all open conditional (algo) orders for symbol.
         
         Args:
             symbol: Trading symbol
             
         Returns:
-            Number of orders cancelled
+            Approximate number of classic orders cancelled (algo batch is always attempted)
         """
+        count = 0
         try:
             response = self._api_call(
                 self._client.cancel_open_orders,
@@ -552,54 +689,65 @@ class BinanceClient:
                 symbol=symbol
             )
             count = len(response) if isinstance(response, list) else 0
-            logger.info(f"Cancelled {count} orders for {symbol}")
-            return count
         except ClientError as e:
-            if e.error_code == -2011:  # No orders to cancel
-                return 0
-            raise
+            if e.error_code != -2011:
+                raise
+        
+        try:
+            self._sign_request(
+                "DELETE",
+                "/fapi/v1/algoOpenOrders",
+                {"symbol": symbol},
+                is_order=True,
+            )
+        except ClientError as e:
+            if e.error_code not in (-2011,):
+                logger.warning(f"cancel_all_algo_open_orders for {symbol}: {e.error_code} {e.error_message}")
+        
+        logger.info(f"Cancelled {count} classic orders for {symbol} (algo open orders cleared if any)")
+        return count
     
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
         """
-        Get open orders.
+        Get open classic orders (GET /fapi/v1/openOrders via get_orders) plus open algo orders.
         
-        Args:
-            symbol: Specific symbol or None for all
-            
-        Returns:
-            List of open Order objects
+        Note: binance-futures-connector's get_open_orders points at /fapi/v1/openOrder (single-order
+        API) and wrongly requires orderId; we use get_orders -> /fapi/v1/openOrders instead.
         """
+        orders: List[Order] = []
+        
         try:
             if symbol:
-                response = self._api_call(self._client.get_open_orders, symbol=symbol)
+                response = self._api_call(self._client.get_orders, symbol=symbol)
             else:
-                response = self._api_call(self._client.get_open_orders)
+                response = self._api_call(self._client.get_orders)
+            if not isinstance(response, list):
+                response = []
+            for o in response:
+                if not o.get("orderId"):
+                    continue
+                try:
+                    parsed = self._parse_order(o)
+                    if parsed.order_id > 0:
+                        orders.append(parsed)
+                except Exception:
+                    continue
         except ParameterRequiredError as e:
-            # Handle library bug where it incorrectly requires orderId
-            # This can happen with some versions of binance-futures-connector
             if "orderId" in str(e):
-                logger.warning(f"Library requires orderId parameter (library bug), returning empty list for {symbol or 'all symbols'}")
-                return []
-            raise
+                logger.warning(f"Open orders list failed (library): {e}")
+            else:
+                raise
         except Exception as e:
-            # Handle any other errors gracefully
             error_str = str(e)
-            if "orderId is mandatory" in error_str or "orderId is mandatory, but received empty" in error_str:
-                logger.warning(f"API requires orderId parameter (unexpected), returning empty list for {symbol or 'all symbols'}")
-                return []
-            raise
+            if "orderId is mandatory" in error_str:
+                logger.warning(f"Open orders list failed: {e}")
+            else:
+                logger.warning(f"Classic open orders fetch failed: {e}")
         
-        orders = []
-        for o in response:
-            # Skip orders without orderId
-            if not o.get("orderId"):
-                continue
-            try:
-                parsed = self._parse_order(o)
-                if parsed.order_id > 0:  # Only valid orders
-                    orders.append(parsed)
-            except Exception:
-                continue
+        try:
+            orders.extend(self._fetch_open_algo_orders(symbol))
+        except Exception as e:
+            logger.warning(f"Open algo orders fetch failed: {e}")
         
         return orders
     
@@ -826,9 +974,6 @@ class BinanceClient:
                 
                 # If all fallbacks failed, log and re-raise
                 logger.error(f"Could not set any leverage for {symbol} (requested {leverage}x)")
-                # Record API error for this symbol
-                if hasattr(self, '_position_tracker') and self._position_tracker:
-                    self._position_tracker._record_api_error(symbol)
                 raise
             else:
                 # Other errors - re-raise
@@ -943,9 +1088,9 @@ class BinanceClient:
             return True  # If we can't validate, allow it
     
     def _parse_order(self, response: Dict) -> Order:
-        """Parse API response into Order object."""
+        """Parse classic /fapi/v1/order response into Order object."""
         return Order(
-            order_id=response.get("orderId", 0),
+            order_id=int(response.get("orderId", 0) or 0),
             client_order_id=response.get("clientOrderId", ""),
             symbol=response.get("symbol", ""),
             side=response.get("side", ""),
@@ -955,7 +1100,8 @@ class BinanceClient:
             stop_price=float(response.get("stopPrice", 0)),
             quantity=float(response.get("origQty", 0)),
             executed_qty=float(response.get("executedQty", 0)),
-            time=response.get("time", 0)
+            time=int(response.get("time", 0) or 0),
+            is_algo=False,
         )
     
     def test_connection(self) -> bool:

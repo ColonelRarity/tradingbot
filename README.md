@@ -1,225 +1,69 @@
-# Binance Scalping Trading Bot
+# Binance USDT-M Futures — multi-pair trading bot (testnet)
 
-Професійний бот для швидкого скальпінгу на біржі Binance з підтримкою технічного аналізу, автоматичного управління ризиками та розміщення ордерів зі стоп-лосом та тейк-профітом.
+Python-бот для **Binance USDⓈ-M Futures testnet**: сканування ліквідних USDT-пар, сигнали (фічі + PyTorch), ризик, **MARKET / STOP_MARKET / TAKE_PROFIT_MARKET**, трекінг позицій, опційний хедж, Telegram.
 
-## 🚀 Можливості
+## Вимоги
 
-- ✅ **Авторизація через Binance API** - безпечне підключення до вашого акаунту
-- 💰 **Перегляд балансу** - моніторинг доступних коштів
-- 📊 **Аналіз ринку** - комплексний технічний аналіз з множиною індикаторів
-- 📈 **Аналіз графіків** - RSI, MACD, EMA, Bollinger Bands, ATR
-- 🎯 **Автоматичне розміщення ордерів** зі стоп-лосом (SL) та тейк-профітом (TP)
-- ⚡ **Скальпінг стратегія** - оптимізована для швидких угод
-- 📝 **Логування** - детальні логи всіх операцій
+- Python 3.10+ (рекомендовано 3.11+)
+- `pip install -r requirements.txt`
 
-## 🧠 Self-learning (опційно)
+Залежність **`binance-futures-connector>=4.1.0`** відповідає актуальному REST USD-M (зокрема `/fapi/v3/account`, `/fapi/v3/positionRisk`, `/fapi/v2/ticker/price` у шарі конектора).
 
-Бот може **накопичувати досвід між перезапусками** та підлаштовуватися під ринок через легку онлайн‑модель (логістична регресія на NumPy).
-
-Як це працює:
-- **На вході**: зберігається snapshot індикаторів/стану ринку (features) у SQLite.
-- **На виході**: бот бере закриті Futures “round trip” угоди з `futures_account_trades` (realizedPnL/commission) і ставить label win/loss.
-- **Навчання**: після кожного нового закриття робиться `partial_fit` (SGD) і модель зберігається на диск.
-- **Використання**: модель може **фільтрувати** входи, якщо прогнозована ймовірність успіху нижча за поріг.
-
-Увімкнення через змінні середовища (за замовчуванням вимкнено):
+## Запуск
 
 ```bash
-# Windows PowerShell
-$env:ENABLE_LEARNING="True"
-$env:LEARNING_MIN_PROBA="0.55"
-$env:LEARNING_WARMUP_SAMPLES="50"
-$env:LEARNING_DB_PATH="data\\learning.db"
-$env:LEARNING_MODEL_PATH="data\\learning_model.json"
+python main.py
+python main.py --log-level DEBUG
 ```
 
-Тюнинг:
-- `LEARNING_MATCH_WINDOW_SEC` (default 900): вікно для матчінгу “entry snapshot” ↔ “round trip entry_time”.
-- `LEARNING_MIN_NET_PNL_USDT_FOR_WIN` (default 0.0): мінімальний net PnL (після комісій), щоб вважати угоду “win”.
-- `LEARNING_SYNC_INTERVAL_SEC` (default 60): як часто підтягувати нові закриті угоди і піднавчатися.
-
-## 📋 Вимоги
-
-- Python 3.8+
-- Binance API ключі (API Key та Secret Key)
-
-## 🔧 Встановлення
-
-1. **Клонуйте або завантажте проект**
-
-2. **Встановіть залежності:**
-```bash
-pip install -r requirements.txt
-```
-
-3. **Налаштуйте API ключі:**
-
-Створіть файл `config.py` на основі `config.py.example`:
-```bash
-cp config.py.example config.py
-```
-
-Відредагуйте `config.py` та введіть свої API ключі:
-```python
-BINANCE_API_KEY = 'ваш_api_key'
-BINANCE_API_SECRET = 'ваш_api_secret'
-```
-
-**АБО** встановіть змінні середовища:
-```bash
-# Windows PowerShell
-$env:BINANCE_API_KEY="ваш_api_key"
-$env:BINANCE_API_SECRET="ваш_api_secret"
-
-# Linux/Mac
-export BINANCE_API_KEY="ваш_api_key"
-export BINANCE_API_SECRET="ваш_api_secret"
-```
-
-## 📖 Використання
-
-### Базове використання
-
-```python
-from binance_scalper_bot import BinanceScalperBot
-
-# Створення бота
-bot = BinanceScalperBot(api_key, api_secret, testnet=False)
-
-# Підключення до акаунту
-bot.login()
-
-# Перегляд балансу
-balance = bot.get_balance('USDT')
-print(f"Баланс USDT: {balance['total']}")
-
-# Аналіз ринку
-analysis = bot.analyze_market('BTCUSDT')
-print(f"Тренд: {analysis['trend']}")
-print(f"RSI: {analysis['rsi']}")
-print(f"Сигнал покупки: {analysis['buy_signal']}")
-
-# Розміщення ордера зі SL та TP
-result = bot.place_order_with_sl_tp(
-    symbol='BTCUSDT',
-    side='BUY',
-    quantity=0.001,
-    stop_loss_percent=0.5,  # 0.5% стоп-лос
-    take_profit_percent=1.0  # 1% тейк-профіт
-)
-```
-
-### Запуск скальпінг стратегії
-
-```python
-# Налаштування параметрів
-bot.stop_loss_percent = 0.5  # 0.5% стоп-лос
-bot.take_profit_percent = 1.0  # 1% тейк-профіт
-bot.max_position_size = 0.1  # 10% від балансу на позицію
-
-# Запуск безперервного режиму
-bot.run_continuous('BTCUSDT', interval=60)  # Перевірка кожні 60 секунд
-```
-
-### Запуск основного скрипта
+Перевірка імпортів без запуску торгівлі:
 
 ```bash
-python binance_scalper_bot.py
+python verify_setup.py
 ```
 
-## 🎛️ Налаштування
+## Конфігурація
 
-### Параметри скальпінгу
+Усі параметри збираються в `config/settings.py`. Ключові змінні середовища:
 
-- `stop_loss_percent` - відсоток стоп-лосу (за замовчуванням 0.5%)
-- `take_profit_percent` - відсоток тейк-профіту (за замовчуванням 1.0%)
-- `max_position_size` - максимальний розмір позиції як частка від балансу (за замовчуванням 0.1 = 10%)
+| Змінна | Призначення |
+|--------|-------------|
+| `BINANCE_FUTURES_API_KEY` / `BINANCE_FUTURES_API_SECRET` | Testnet API |
+| `BINANCE_DEMO_API_KEY` / `BINANCE_DEMO_API_SECRET` | Альтернативні імена для тих самих ключів |
+| `DEFAULT_LEVERAGE` | Плече за замовчуванням |
+| `MAX_PAIRS_TO_SCAN` | Скільки пар сканувати |
+| `MAX_CONCURRENT_POSITIONS` | Ліміт одночасних позицій |
+| `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Сповіщення |
 
-### Технічні індикатори
+### WebSocket (оновлення Binance 2026+)
 
-Бот використовує наступні індикатори для аналізу:
+На **production** Binance розділяє WebSocket на `/public`, `/market`, `/private`. Для **testnet** за замовчуванням використовуються префікси з `ExchangeConfig`:
 
-- **RSI (Relative Strength Index)** - визначення перекупленості/перепроданості
-- **MACD** - визначення тренду та моментуму
-- **EMA (9, 21, 50)** - експоненційні ковзні середні для визначення тренду
-- **Bollinger Bands** - визначення волатильності та екстремальних значень
-- **ATR (Average True Range)** - вимірювання волатильності
+- `BINANCE_FUTURES_WS_STREAM_PREFIX` — combined market streams (за замовчуванням `wss://stream.binancefuture.com/stream`)
+- `BINANCE_FUTURES_WS_USER_PREFIX` — user stream до `/<listenKey>` (за замовчуванням `wss://fstream.binancefuture.com/ws`)
 
-### Сигнали для входу
+Для live-торгівлі (не testnet) у `utils/websocket_client.py` при `testnet=False` можна задати ті самі змінні; типовий production combined URL: `wss://fstream.binance.com/market/stream`.
 
-**Сигнал на покупку:**
-- RSI < 30 (перепродано)
-- MACD > Signal (позитивний момент)
-- Ціна < нижньої смуги Bollinger Bands
-- Високий об'єм торгівлі
+## Структура проєкту
 
-**Сигнал на продаж:**
-- RSI > 70 (перекуплено)
-- MACD < Signal (негативний момент)
-- Ціна > верхньої смуги Bollinger Bands
-- Високий об'єм торгівлі
+- `main.py` — головний цикл, скан ринку, сигнали, керування позиціями
+- `exchange/binance_client.py` — REST, ордери, баланс, позиції
+- `core/` — ринкові дані, сигнали, ризик, ордери, хедж, позиції
+- `ml/` — модель, тренування, інференс
+- `utils/websocket_client.py` — опційний WS-клієнт (URL з конфігу)
+- `telegram_monitor.py` — Telegram
 
-## ⚠️ Важливі зауваження
+## Тести
 
-1. **Тестування**: Спочатку протестуйте бота на тестовій біржі (testnet=True)
-2. **Ризики**: Торгівля криптовалютами несе ризики втрати коштів
-3. **API ключі**: Ніколи не публікуйте свої API ключі
-4. **Обмеження**: Переконайтеся, що ваш API ключ має права на торгівлю
-5. **Моніторинг**: Завжди моніторьте роботу бота, особливо на початку
-
-## 📊 Статистика
-
-Бот веде статистику:
-- Кількість угод
-- Кількість виграшів/програшів
-- Загальний прибуток
-- Вінрейт
-
-```python
-stats = bot.get_statistics()
-print(f"Вінрейт: {stats['win_rate']:.2f}%")
+```bash
+pytest tests/ -q
 ```
 
-## 🔒 Безпека
+## Важливо
 
-- Використовуйте окремі API ключі з обмеженими правами
-- Не надавайте права на виведення коштів
-- Регулярно перевіряйте логи на підозрілу активність
-- Використовуйте 2FA на біржі Binance
+- Репозиторій задуманий під **testnet**; `settings.validate()` вимагає `testnet` у `base_url`.
+- Торгівля криптовалютами несе ризики; тестові ключі теж не варто публікувати у відкритих репозиторіях.
 
-### Секрети та конфіг
+## Ліцензія
 
-- **Не зберігайте ключі/токени в репозиторії**. Рекомендовано використовувати **ENV змінні** (див. `env.example.ps1`).
-- Якщо у вас раніше були ключі в `config.py`, **перегенеруйте/змініть їх** у Binance і використовуйте нові.
-
-## 📝 Логи
-
-Всі операції логуються в файл `trading_bot.log` та виводяться в консоль.
-
-## 🐛 Усунення помилок
-
-**Помилка підключення:**
-- Перевірте правильність API ключів
-- Перевірте інтернет-з'єднання
-- Переконайтеся, що API ключ активний
-
-**Помилка розміщення ордера:**
-- Перевірте достатність балансу
-- Перевірте мінімальні вимоги до ордерів
-- Перевірте права API ключа
-
-## 📄 Ліцензія
-
-Цей проект створено для освітніх цілей. Використовуйте на свій ризик.
-
-## 🤝 Підтримка
-
-При виникненні проблем перевірте:
-1. Логи в `trading_bot.log`
-2. Документацію Binance API
-3. Правильність налаштувань
-
----
-
-**Увага**: Торгівля криптовалютами є ризикованою діяльністю. Завжди використовуйте стоп-лоси та не інвестуйте більше, ніж можете втратити.
-
+Освітній / експериментальний проєкт — використання на власний ризик.

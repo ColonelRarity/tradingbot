@@ -378,11 +378,13 @@ class HedgeManager:
             # Place market close order
             close_side = OrderSide.SELL if hedge.side == "LONG" else OrderSide.BUY
             
+            dual = self.client.is_dual_side_position()
             order = self.client.place_market_order(
                 symbol=hedge.symbol,
                 side=close_side,
                 quantity=hedge.quantity,
-                reduce_only=True
+                reduce_only=True,
+                position_side=hedge.side if dual else None,
             )
             
             # Cancel any remaining orders

@@ -3,8 +3,8 @@ Order Manager
 
 Handles all order operations:
 - Entry with MARKET orders
-- Stop Loss with STOP_MARKET
-- Take Profit with TAKE_PROFIT_MARKET
+- Stop Loss with STOP_MARKET (Binance Algo Order API)
+- Take Profit with TAKE_PROFIT_MARKET (Binance Algo Order API)
 - Order cancellation and replacement
 - Orphan order cleanup
 - Idempotent operations
@@ -64,6 +64,8 @@ class ManagedOrder:
     
     # Status
     is_active: bool = True
+    # True if order_id is Binance algoId (conditional TP/SL)
+    is_algo_order: bool = False
 
 
 @dataclass
@@ -110,6 +112,96 @@ class OrderManager:
         
         logger.info("OrderManager initialized")
     
+    def _price_close_for_idempotency(self, symbol: str, a: float, b: float) -> bool:
+        """True if a and b are the same price for practical purposes (tick-based)."""
+        try:
+            tick = float(self.client.get_symbol_info(symbol).get("tick_size") or 0.0)
+        except Exception:
+            tick = 0.0
+        tol = max(tick * 2, abs(a) * 1e-8, abs(b) * 1e-8, 1e-12)
+        return abs(a - b) <= tol
+    
+    def _precheck_take_profit_vs_market(
+        self, position_side: str, stop_price: float, current_price: float
+    ) -> Optional[OrderResult]:
+        """
+        Same distance rules as place_take_profit. Returns failed OrderResult if invalid.
+        """
+        if current_price <= 0:
+            return None
+        if position_side == "LONG":
+            if stop_price <= current_price:
+                return OrderResult(
+                    success=False,
+                    error_code="TP_TOO_CLOSE",
+                    error_message=f"TP price {stop_price} <= current price {current_price}",
+                )
+            min_distance = current_price * 0.001
+            if stop_price - current_price < min_distance:
+                return OrderResult(
+                    success=False,
+                    error_code="TP_TOO_CLOSE",
+                    error_message="TP too close to current price",
+                )
+        else:
+            if stop_price >= current_price:
+                return OrderResult(
+                    success=False,
+                    error_code="TP_TOO_CLOSE",
+                    error_message=f"TP price {stop_price} >= current price {current_price}",
+                )
+            min_distance = current_price * 0.001
+            if current_price - stop_price < min_distance:
+                return OrderResult(
+                    success=False,
+                    error_code="TP_TOO_CLOSE",
+                    error_message="TP too close to current price",
+                )
+        return None
+    
+    def _precheck_stop_loss_vs_market(
+        self,
+        position_side: str,
+        stop_price: float,
+        current_price: float,
+        is_breakeven: bool,
+    ) -> Optional[OrderResult]:
+        """Same distance rules as place_stop_loss (non-adjusting precheck)."""
+        if current_price <= 0:
+            return None
+        min_distance_multiplier = 0.0001 if is_breakeven else 0.0005
+        if position_side == "LONG":
+            if not is_breakeven and stop_price >= current_price:
+                return OrderResult(
+                    success=False,
+                    error_code="SL_TOO_CLOSE",
+                    error_message=f"SL price {stop_price} >= current price {current_price}",
+                )
+            min_distance = current_price * min_distance_multiplier
+            if current_price - stop_price < min_distance:
+                if not is_breakeven:
+                    return OrderResult(
+                        success=False,
+                        error_code="SL_TOO_CLOSE",
+                        error_message="SL too close to current price",
+                    )
+        else:
+            if not is_breakeven and stop_price <= current_price:
+                return OrderResult(
+                    success=False,
+                    error_code="SL_TOO_CLOSE",
+                    error_message=f"SL price {stop_price} <= current price {current_price}",
+                )
+            min_distance = current_price * min_distance_multiplier
+            if stop_price - current_price < min_distance:
+                if not is_breakeven:
+                    return OrderResult(
+                        success=False,
+                        error_code="SL_TOO_CLOSE",
+                        error_message="SL too close to current price",
+                    )
+        return None
+    
     # ==================== Entry Orders ====================
     
     def place_entry_order(
@@ -149,10 +241,12 @@ class OrderManager:
         logger.info(f"Placing ENTRY: {side} {quantity} {symbol} (order_side={order_side.value})")
         
         try:
+            dual = self.client.is_dual_side_position()
             order = self.client.place_market_order(
                 symbol=symbol,
                 side=order_side,
-                quantity=quantity
+                quantity=quantity,
+                position_side=side if dual else None,
             )
             
             # Validate order_id from API response
@@ -250,7 +344,7 @@ class OrderManager:
                             # Found existing SL order for this position - cancel it
                             if order.order_id and order.order_id > 0:
                                 logger.warning(f"Cancelling existing SL order {order.order_id} for position {position_id} before placing new one")
-                                self._cancel_order(symbol, order.order_id)
+                                self._cancel_order(symbol, order.order_id, is_algo=order.is_algo)
         except Exception as e:
             # If get_open_orders fails, try to cancel from internal tracker
             logger.warning(f"Failed to get open orders for {symbol}, trying to cancel from tracker: {e}")
@@ -261,7 +355,7 @@ class OrderManager:
                             tracked_order.purpose == purpose and
                             tracked_order.parent_position_id == position_id):
                             logger.warning(f"Cancelling tracked SL order {order_id} before placing new one for {symbol}")
-                            self._cancel_order(symbol, order_id)
+                            self._cancel_order(symbol, order_id, is_algo=tracked_order.is_algo_order)
         
         # Validate SL price if current_price provided
         if current_price is not None:
@@ -342,20 +436,25 @@ class OrderManager:
         
         logger.info(f"Placing SL: {order_side.value} {symbol} @ {stop_price} | Qty: {quantity:.2f}{distance_info} | closePosition={use_close_position}")
         
+        dual = self.client.is_dual_side_position()
+        api_pos_side = side if (is_hedge or dual) and side in ("LONG", "SHORT") else None
+        
         try:
             if use_close_position:
                 order = self.client.place_stop_market(
                     symbol=symbol,
                     side=order_side,
                     stop_price=stop_price,
-                    close_position=True
+                    close_position=True,
+                    position_side=api_pos_side,
                 )
             else:
                 order = self.client.place_stop_market(
                     symbol=symbol,
                     side=order_side,
                     stop_price=stop_price,
-                    quantity=quantity
+                    quantity=quantity,
+                    position_side=api_pos_side,
                 )
             
             # Validate order_id from API response
@@ -377,12 +476,9 @@ class OrderManager:
                 quantity=quantity,
                 stop_price=stop_price,
                 purpose=purpose,
-                parent_position_id=position_id
+                parent_position_id=position_id,
+                is_algo_order=order.is_algo,
             )
-            
-            self._track_order(managed)
-            
-            logger.info(f"✅ SL placed successfully: OrderID={order.order_id} | {symbol} | {order_side.value} @ {stop_price}{distance_info}")
             
             return OrderResult(success=True, order=managed)
             
@@ -432,7 +528,8 @@ class OrderManager:
                         symbol=symbol,
                         side=order_side,
                         stop_price=stop_price,
-                        close_position=True
+                        close_position=True,
+                        position_side=api_pos_side,
                     )
                     
                     # Validate order_id from API response
@@ -454,12 +551,9 @@ class OrderManager:
                         quantity=quantity,  # Keep original quantity for tracking
                         stop_price=stop_price,
                         purpose=purpose,
-                        parent_position_id=position_id
+                        parent_position_id=position_id,
+                        is_algo_order=order.is_algo,
                     )
-                    
-                    self._track_order(managed)
-                    
-                    logger.info(f"✅ SL placed successfully with closePosition=true: OrderID={order.order_id} | {symbol} | {order_side.value} @ {stop_price}{distance_info}")
                     
                     return OrderResult(success=True, order=managed)
                 except Exception as retry_error:
@@ -530,7 +624,7 @@ class OrderManager:
                 logger.warning(f"get_open_orders returned empty (library bug), but found SL in tracker (order_id={existing_tracked.order_id}). "
                              f"Attempting to cancel before creating new order.")
                 # Try to cancel the tracked order before creating new one
-                cancelled = self._cancel_order(symbol, existing_tracked.order_id)
+                cancelled = self._cancel_order(symbol, existing_tracked.order_id, is_algo=existing_tracked.is_algo_order)
                 if cancelled:
                     logger.debug(f"Successfully cancelled tracked SL order {existing_tracked.order_id} before creating new one")
                 else:
@@ -538,26 +632,35 @@ class OrderManager:
         
         # If found on exchange, check if update needed
         if existing_sl_order:
-            # Idempotency check - don't update if price is same
-            if abs(existing_sl_order.stop_price - new_stop_price) < 0.01:
-                # Update tracking and return existing
+            if self._price_close_for_idempotency(symbol, existing_sl_order.stop_price, new_stop_price):
                 existing_tracked = self._find_order_by_purpose(symbol, position_id, purpose)
                 if existing_tracked:
                     return OrderResult(success=True, order=existing_tracked)
             
-            # Cancel existing SL order from exchange (source of truth)
+            if current_price is not None:
+                bad = self._precheck_stop_loss_vs_market(
+                    position_side, new_stop_price, current_price, is_breakeven
+                )
+                if bad:
+                    return bad
+            
+            saved_old_sl = existing_sl_order.stop_price
+            had_cancelled_sl = False
             if existing_sl_order.order_id and existing_sl_order.order_id > 0:
-                cancelled = self._cancel_order(symbol, existing_sl_order.order_id)
+                cancelled = self._cancel_order(symbol, existing_sl_order.order_id, is_algo=existing_sl_order.is_algo)
                 if not cancelled:
                     logger.warning(f"Failed to cancel existing SL {existing_sl_order.order_id} from exchange")
                 else:
-                    # Mark as inactive in tracking if exists
+                    had_cancelled_sl = True
                     with self._orders_lock:
-                        if (symbol in self._orders and 
+                        if (symbol in self._orders and
                             existing_sl_order.order_id in self._orders[symbol]):
                             self._orders[symbol][existing_sl_order.order_id].is_active = False
+        else:
+            saved_old_sl = None
+            had_cancelled_sl = False
         
-        return self.place_stop_loss(
+        result = self.place_stop_loss(
             symbol=symbol,
             side=position_side,
             stop_price=new_stop_price,
@@ -567,6 +670,28 @@ class OrderManager:
             current_price=current_price,
             is_breakeven=is_breakeven
         )
+        
+        if not result.success and had_cancelled_sl and saved_old_sl is not None:
+            logger.warning(
+                f"[{symbol}] SL replace failed after cancel ({result.error_code}); "
+                f"attempting rollback to previous trigger {saved_old_sl}"
+            )
+            rollback = self.place_stop_loss(
+                symbol=symbol,
+                side=position_side,
+                stop_price=saved_old_sl,
+                quantity=quantity,
+                position_id=position_id,
+                is_hedge=is_hedge,
+                current_price=current_price,
+                is_breakeven=is_breakeven,
+            )
+            if rollback.success:
+                logger.info(f"[{symbol}] SL rollback placed: OrderID={rollback.order.order_id}")
+            else:
+                logger.error(f"[{symbol}] SL rollback also failed: {rollback.error_message}")
+        
+        return result
     
     # ==================== Take Profit Orders ====================
     
@@ -618,7 +743,7 @@ class OrderManager:
                             # Found existing TP order for this position - cancel it
                             if order.order_id and order.order_id > 0:
                                 logger.warning(f"Cancelling existing TP order {order.order_id} for position {position_id} before placing new one")
-                                self._cancel_order(symbol, order.order_id)
+                                self._cancel_order(symbol, order.order_id, is_algo=order.is_algo)
         except Exception as e:
             # If get_open_orders fails, try to cancel from internal tracker
             logger.warning(f"Failed to get open orders for {symbol}, trying to cancel from tracker: {e}")
@@ -629,7 +754,7 @@ class OrderManager:
                             tracked_order.purpose == purpose and
                             tracked_order.parent_position_id == position_id):
                             logger.warning(f"Cancelling tracked TP order {order_id} for position {position_id} before placing new one")
-                            self._cancel_order(symbol, order_id)
+                            self._cancel_order(symbol, order_id, is_algo=tracked_order.is_algo_order)
         
         distance_info = ""
         if current_price is not None:
@@ -693,20 +818,25 @@ class OrderManager:
         
         logger.info(f"Placing TP: {order_side.value} {symbol} @ {stop_price} | Qty: {quantity:.2f}{distance_info} | closePosition={use_close_position}")
         
+        dual = self.client.is_dual_side_position()
+        api_pos_side = side if (is_hedge or dual) and side in ("LONG", "SHORT") else None
+        
         try:
             if use_close_position:
                 order = self.client.place_take_profit_market(
                     symbol=symbol,
                     side=order_side,
                     stop_price=stop_price,
-                    close_position=True
+                    close_position=True,
+                    position_side=api_pos_side,
                 )
             else:
                 order = self.client.place_take_profit_market(
                     symbol=symbol,
                     side=order_side,
                     stop_price=stop_price,
-                    quantity=quantity
+                    quantity=quantity,
+                    position_side=api_pos_side,
                 )
             
             # Validate order_id from API response
@@ -728,12 +858,9 @@ class OrderManager:
                 quantity=quantity,
                 stop_price=stop_price,
                 purpose=purpose,
-                parent_position_id=position_id
+                parent_position_id=position_id,
+                is_algo_order=order.is_algo,
             )
-            
-            self._track_order(managed)
-            
-            logger.info(f"✅ TP placed successfully: OrderID={order.order_id} | {symbol} | {order_side.value} @ {stop_price}{distance_info}")
             
             return OrderResult(success=True, order=managed)
             
@@ -783,7 +910,8 @@ class OrderManager:
                         symbol=symbol,
                         side=order_side,
                         stop_price=stop_price,
-                        close_position=True
+                        close_position=True,
+                        position_side=api_pos_side,
                     )
                     
                     # Validate order_id from API response
@@ -805,12 +933,9 @@ class OrderManager:
                         quantity=quantity,  # Keep original quantity for tracking
                         stop_price=stop_price,
                         purpose=purpose,
-                        parent_position_id=position_id
+                        parent_position_id=position_id,
+                        is_algo_order=order.is_algo,
                     )
-                    
-                    self._track_order(managed)
-                    
-                    logger.info(f"✅ TP placed successfully with closePosition=true: OrderID={order.order_id} | {symbol} | {order_side.value} @ {stop_price}{distance_info}")
                     
                     return OrderResult(success=True, order=managed)
                 except Exception as retry_error:
@@ -889,38 +1014,46 @@ class OrderManager:
                 logger.warning(f"get_open_orders returned empty (library bug), but found TP in tracker (order_id={existing_tracked.order_id}). "
                              f"Attempting to cancel before creating new order.")
                 # Try to cancel the tracked order before creating new one
-                cancelled = self._cancel_order(symbol, existing_tracked.order_id)
+                cancelled = self._cancel_order(symbol, existing_tracked.order_id, is_algo=existing_tracked.is_algo_order)
                 if cancelled:
                     logger.debug(f"Successfully cancelled tracked TP order {existing_tracked.order_id} before creating new one")
                 else:
                     logger.warning(f"Failed to cancel tracked TP order {existing_tracked.order_id}, but proceeding with new order creation")
         
+        saved_old_tp: Optional[float] = None
+        had_cancelled_tp = False
+        
         # If found on exchange, check if update needed
         if existing_tp_order:
-            # Idempotency check - don't update if price is same
-            if abs(existing_tp_order.stop_price - new_stop_price) < 0.01:
+            if self._price_close_for_idempotency(symbol, existing_tp_order.stop_price, new_stop_price):
                 logger.debug(f"TP update skipped (idempotency): {symbol} | Price unchanged: {new_stop_price:.8f}")
                 existing_tracked = self._find_order_by_purpose(symbol, position_id, purpose)
                 if existing_tracked:
                     return OrderResult(success=True, order=existing_tracked)
             
+            if current_price is not None:
+                bad = self._precheck_take_profit_vs_market(position_side, new_stop_price, current_price)
+                if bad:
+                    return bad
+            
+            saved_old_tp = existing_tp_order.stop_price
+            
             logger.info(f"Updating TP: {symbol} | Old: {existing_tp_order.stop_price:.8f} → New: {new_stop_price:.8f} | "
                        f"Cancel existing order {existing_tp_order.order_id}")
             
-            # Cancel existing TP order from exchange (source of truth)
             if existing_tp_order.order_id and existing_tp_order.order_id > 0:
-                cancelled = self._cancel_order(symbol, existing_tp_order.order_id)
+                cancelled = self._cancel_order(symbol, existing_tp_order.order_id, is_algo=existing_tp_order.is_algo)
                 if not cancelled:
                     logger.warning(f"Failed to cancel existing TP {existing_tp_order.order_id} from exchange")
                 else:
+                    had_cancelled_tp = True
                     logger.debug(f"Existing TP order {existing_tp_order.order_id} cancelled successfully")
-                    # Mark as inactive in tracking if exists
                     with self._orders_lock:
-                        if (symbol in self._orders and 
+                        if (symbol in self._orders and
                             existing_tp_order.order_id in self._orders[symbol]):
                             self._orders[symbol][existing_tp_order.order_id].is_active = False
         
-        return self.place_take_profit(
+        result = self.place_take_profit(
             symbol=symbol,
             side=position_side,
             stop_price=new_stop_price,
@@ -929,6 +1062,27 @@ class OrderManager:
             is_hedge=is_hedge,
             current_price=current_price
         )
+        
+        if not result.success and had_cancelled_tp and saved_old_tp is not None:
+            logger.warning(
+                f"[{symbol}] TP replace failed after cancel ({result.error_code}); "
+                f"attempting rollback to previous trigger {saved_old_tp}"
+            )
+            rollback = self.place_take_profit(
+                symbol=symbol,
+                side=position_side,
+                stop_price=saved_old_tp,
+                quantity=quantity,
+                position_id=position_id,
+                is_hedge=is_hedge,
+                current_price=current_price,
+            )
+            if rollback.success:
+                logger.info(f"[{symbol}] TP rollback placed: OrderID={rollback.order.order_id}")
+            else:
+                logger.error(f"[{symbol}] TP rollback also failed: {rollback.error_message}")
+        
+        return result
     
     # ==================== Cancellation ====================
     
@@ -960,7 +1114,7 @@ class OrderManager:
                 # Mark as inactive anyway
                 order.is_active = False
                 continue
-            if self._cancel_order(symbol, order.order_id):
+            if self._cancel_order(symbol, order.order_id, is_algo=order.is_algo_order):
                 cancelled += 1
         
         logger.info(f"Cancelled {cancelled} orders for position {position_id}")
@@ -991,15 +1145,14 @@ class OrderManager:
             logger.error(f"Failed to cancel all orders for {symbol}: {e}")
             return 0
     
-    def _cancel_order(self, symbol: str, order_id: int) -> bool:
-        """Cancel specific order."""
-        # Validate order_id before attempting cancellation
+    def _cancel_order(self, symbol: str, order_id: int, is_algo: bool = False) -> bool:
+        """Cancel specific classic or algo order."""
         if not order_id or order_id <= 0:
             logger.debug(f"Skipping cancel for invalid order_id: {order_id} (symbol: {symbol})")
             return False
         
         try:
-            result = self.client.cancel_order(symbol, order_id)
+            result = self.client.cancel_order(symbol, order_id, is_algo=is_algo)
             
             with self._orders_lock:
                 if symbol in self._orders and order_id in self._orders[symbol]:
@@ -1059,7 +1212,7 @@ class OrderManager:
                 order.is_active = False
                 continue
             logger.warning(f"Cleaning orphan order: {order.order_id} (position {order.parent_position_id})")
-            if self._cancel_order(symbol, order.order_id):
+            if self._cancel_order(symbol, order.order_id, is_algo=order.is_algo_order):
                 cancelled += 1
         
         return cancelled
@@ -1106,7 +1259,8 @@ class OrderManager:
                             quantity=order.quantity,
                             stop_price=order.stop_price,
                             purpose="UNKNOWN",
-                            parent_position_id=None
+                            parent_position_id=None,
+                            is_algo_order=order.is_algo,
                         )
                         self._orders[symbol][order.order_id] = managed
                         added += 1
@@ -1148,7 +1302,7 @@ class OrderManager:
                 # Cancel all STOP_MARKET and TAKE_PROFIT_MARKET orders
                 if order.order_type in [OrderType.STOP_MARKET.value, OrderType.TAKE_PROFIT_MARKET.value]:
                     if order.order_id and order.order_id > 0:
-                        if self._cancel_order(symbol, order.order_id):
+                        if self._cancel_order(symbol, order.order_id, is_algo=order.is_algo):
                             cancelled += 1
                             cancelled_order_ids.add(order.order_id)
                             logger.debug(f"Cancelled {order.order_type} order {order.order_id} for {symbol} (cleanup due to max limit)")
@@ -1189,7 +1343,7 @@ class OrderManager:
                     if (tracked_order.is_active and
                         tracked_order.order_type in [OrderType.STOP_MARKET.value, OrderType.TAKE_PROFIT_MARKET.value]):
                         if tracked_order.order_id and tracked_order.order_id > 0:
-                            if self._cancel_order(symbol, tracked_order.order_id):
+                            if self._cancel_order(symbol, tracked_order.order_id, is_algo=tracked_order.is_algo_order):
                                 cancelled += 1
                                 cancelled_order_ids.add(tracked_order.order_id)
                                 logger.debug(f"Cancelled tracked {tracked_order.order_type} order {tracked_order.order_id} for {symbol} (cleanup due to max limit)")

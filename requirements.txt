@@ -1,5 +1,5 @@
-# Binance API
-binance-futures-connector>=3.7.0
+# Binance API (4.1+ uses REST /fapi/v3/account, /fapi/v3/positionRisk, /fapi/v2/ticker/price per upstream changelog)
+binance-futures-connector>=4.1.0
 
 # Data processing
 pandas>=2.0.0

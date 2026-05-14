@@ -20,12 +20,15 @@ import logging
 import threading
 import argparse
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Force unbuffered output
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+# Force line-buffered output where supported (Windows / redirected stdout safe)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, OSError):
+    pass
 
 # Setup logging first
 from utils.logging_config import init_logging, get_logger
@@ -100,7 +103,9 @@ class MultiPairTradingBot:
         self._last_urgent_breakeven_check = 0
         self._last_signal_check = 0
         self._last_symbol_refresh = 0
-        
+        # Зміщення вікна перевірки сигналів (round-robin по active_symbols)
+        self._signal_check_offset: int = 0
+
         logger.info("Multi-Pair Trading Bot initialized")
     
     def _init_components(self) -> None:
@@ -180,7 +185,16 @@ class MultiPairTradingBot:
         # Initial market scan
         print("\nPerforming initial market scan...", flush=True)
         self._scan_market()
-        
+
+        # Не запускати одразу refresh сигналів / перевірку сигналів у тій самій секунді
+        # (раніше _last_* = 0 давало «все одразу» і дубль логів)
+        t0 = time.time()
+        self._last_symbol_refresh = t0
+        self._last_signal_check = t0
+        self._last_position_update = t0
+        self._last_urgent_breakeven_check = t0
+        self._last_model_retrain = t0
+
         # Start main loop
         print("\nStarting main trading loop...", flush=True)
         self._running = True
@@ -281,7 +295,6 @@ class MultiPairTradingBot:
                 print(f"DEBUG: Removed stale symbol: {symbol}", flush=True)
 
             print(f"DEBUG: Active symbols refreshed: {len(self.active_symbols)} total", flush=True)
-            self._last_symbol_refresh = time.time()
 
         except Exception as e:
             print(f"DEBUG: Error refreshing symbols: {e}", flush=True)
@@ -304,79 +317,77 @@ class MultiPairTradingBot:
         
         print(f"Analyzing {len(symbols)} pairs with parallel workers...", flush=True)
         
-        # Analyze symbols in parallel
+        # Analyze symbols in parallel (workers must NOT mutate shared market_data_cache)
         opportunities = []
         completed = 0
-        
-        def scan_symbol(symbol: str) -> Optional[Dict]:
-            """Scan single symbol and return opportunity if found."""
+
+        def scan_symbol(symbol: str) -> Optional[Tuple[Optional[Dict], MarketData]]:
+            """
+            Build MarketData in the worker thread only; main thread merges into cache.
+            Returns (opportunity_dict_or_none, market_data) after successful init, else None.
+            """
             try:
-                # Get or create market data
-                if symbol not in self.market_data_cache:
-                    self.market_data_cache[symbol] = MarketData(symbol, self.client)
-                
-                md = self.market_data_cache[symbol]
-                
-                # Initialize if needed
-                if not md._initialized:
-                    if not md.initialize():
-                        return None
-                else:
-                    md.update()
-                
+                md = MarketData(symbol, self.client)
+                if not md.initialize():
+                    return None
+                md.update()
                 snapshot = md.get_snapshot()
                 if not snapshot:
-                    return None
-                
-                # Check if we already have position
+                    return (None, md)
+
                 has_position = self.position_tracker.has_open_position(symbol)
                 has_hedge = self.position_tracker.has_hedge(symbol)
-                
-                # Generate signal
+
                 signal = self.signal_engine.generate_signal(
                     market_data=md,
                     has_open_position=has_position,
-                    has_hedge=has_hedge
+                    has_hedge=has_hedge,
                 )
-                
+
                 if signal.is_valid and signal.direction != SignalDirection.NONE:
-                    # Setup trading params
                     self._setup_trading_params(symbol)
-                    
-                    return {
-                        "symbol": symbol,
-                        "signal": signal,
-                        "snapshot": snapshot,
-                        "confidence": signal.confidence
-                    }
-                
-                return None
-                
+                    return (
+                        {
+                            "symbol": symbol,
+                            "signal": signal,
+                            "snapshot": snapshot,
+                            "confidence": signal.confidence,
+                        },
+                        md,
+                    )
+                return (None, md)
+
             except Exception as e:
                 logger.debug(f"Error scanning {symbol}: {e}")
                 return None
-        
+
         # Use ThreadPoolExecutor for parallel scanning
         max_workers = min(10, len(symbols))  # Max 10 parallel workers
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_symbol = {executor.submit(scan_symbol, sym): sym for sym in symbols}
-            
+
             for future in as_completed(future_to_symbol):
                 completed += 1
                 symbol = future_to_symbol[future]
-                
+
                 try:
-                    result = future.result()
-                    if result:
-                        opportunities.append(result)
-                        direction = result['signal'].direction.value
-                        conf = result['confidence']
-                        print(f"  [{completed}/{len(symbols)}] {symbol}: {direction} (conf: {conf:.3f})", flush=True)
-                
+                    packed = future.result()
+                    if packed is not None:
+                        result, md = packed
+                        self.market_data_cache[md.symbol] = md
+                        if result:
+                            opportunities.append(result)
+                            direction = result["signal"].direction.value
+                            conf = result["confidence"]
+                            print(
+                                f"  [{completed}/{len(symbols)}] {symbol}: {direction} (conf: {conf:.3f})",
+                                flush=True,
+                            )
+
                 except Exception as e:
                     logger.debug(f"Future error for {symbol}: {e}")
-                
+
                 # Progress indicator
                 if completed % 10 == 0:
                     print(f"  Progress: {completed}/{len(symbols)}...", flush=True)
@@ -401,17 +412,19 @@ class MultiPairTradingBot:
         # This ensures we only try to open positions in symbols that still have good signals
         top_opportunities = opportunities[:20]  # Top 20 from scan
         verified_top_symbols = []
-        
+
+        open_positions_scan = self.position_tracker.get_open_positions()
+        open_syms_scan = {pos.symbol for pos in open_positions_scan}
+
         logger.info(f"Re-verifying confidence for top {len(top_opportunities)} opportunities...")
         for opp in top_opportunities:
             symbol = opp["symbol"]
             cached_confidence = opp["confidence"]
-            
+
             # Skip if already has open position
-            open_positions = self.position_tracker.get_open_positions()
-            if any(pos.symbol == symbol for pos in open_positions):
+            if symbol in open_syms_scan:
                 continue
-            
+
             # Re-check signal and confidence
             try:
                 if symbol in self.market_data_cache:
@@ -570,16 +583,6 @@ class MultiPairTradingBot:
                     except Exception as e:
                         logger.error(f"Signal check failed: {e}")
                     self._last_signal_check = now
-
-                # === Symbol Refresh (every 5 minutes) ===
-                if now - self._last_symbol_refresh >= 300:  # 5 minutes
-                    logger.debug("Starting symbol refresh...")
-                    self._refresh_active_symbols()
-                    self._last_symbol_refresh = now
-
-                # === Market Scan (every 12 hours) ===
-                if now - self._last_market_scan >= self.settings.market_data.market_scan_interval:
-                    self._scan_market()
 
                 # === Model Retraining (every hour) ===
                 if now - self._last_model_retrain >= 3600:
@@ -885,6 +888,9 @@ class MultiPairTradingBot:
     def _check_signals_multi(self) -> None:
         """Check signals across all active symbols."""
         logger.debug(f"Starting signal check for {len(self.active_symbols)} symbols")
+        if not self.active_symbols:
+            logger.debug("No active symbols, skipping signal check")
+            return
         try:
             # HARD CHECK: Get real positions from exchange first
             exchange_positions = self.client.get_positions()
@@ -918,29 +924,36 @@ class MultiPairTradingBot:
         
         # Check each active symbol (limit to prevent overwhelming API)
         max_symbols_per_check = 5  # Process max 5 symbols per check
-        symbols_to_check = self.active_symbols[:max_symbols_per_check]
-        # Log problematic symbols
+        n = len(self.active_symbols)
+        start = self._signal_check_offset % n
+        symbols_to_check = [
+            self.active_symbols[(start + i) % n] for i in range(min(max_symbols_per_check, n))
+        ]
+        self._signal_check_offset = (start + len(symbols_to_check)) % n
+
         problematic_symbols = [s for s in symbols_to_check if self.position_tracker.is_problematic_symbol(s)]
         if problematic_symbols:
-            print(f"DEBUG: PROBLEMATIC SYMBOLS in batch: {problematic_symbols}", flush=True)
+            logger.debug("Problematic symbols in signal batch: %s", problematic_symbols)
 
-        print(f"DEBUG: Processing {len(symbols_to_check)}/{len(self.active_symbols)} symbols: {symbols_to_check}", flush=True)
+        logger.debug(
+            "Signal check batch %s/%s (offset=%s): %s",
+            len(symbols_to_check),
+            n,
+            start,
+            symbols_to_check,
+        )
+
+        exchange_positions = list(exchange_positions)
+        real_count = real_position_count
 
         for i, symbol in enumerate(symbols_to_check):
             logger.debug(f"[{i+1}/{len(symbols_to_check)}] Checking {symbol}")
-            # RE-CHECK before each iteration
-            try:
-                exchange_positions = self.client.get_positions()
-                real_count = len([p for p in exchange_positions if abs(p.size) > 0.0001])
-            except Exception as e:
-                logger.debug(f"{symbol} - ERROR: Failed to get positions: {e}")
-                continue
 
             if real_count >= max_positions:
                 logger.debug(f"{symbol} - SKIPPED: Max positions reached ({real_count}/{max_positions})")
                 break
 
-            # Skip if already have position for this symbol
+            # Skip if already have position for this symbol (use last known snapshot)
             if any(p.symbol == symbol for p in exchange_positions if abs(p.size) > 0.0001):
                 logger.debug(f"{symbol} - SKIPPED: Already have exchange position")
                 continue
@@ -958,7 +971,7 @@ class MultiPairTradingBot:
             if self.position_tracker.is_problematic_symbol(symbol):
                 logger.debug(f"{symbol} - SKIPPED: Problematic symbol")
                 continue
-            
+
             try:
                 # Get market data with error handling - skip if not in cache
                 if symbol not in self.market_data_cache:
@@ -968,7 +981,7 @@ class MultiPairTradingBot:
                 md = self.market_data_cache[symbol]
 
                 # Quick check if market data is initialized
-                if not hasattr(md, '_initialized') or not md._initialized:
+                if not hasattr(md, "_initialized") or not md._initialized:
                     logger.debug(f"{symbol} - SKIPPED: Market data not initialized")
                     continue
 
@@ -1001,7 +1014,7 @@ class MultiPairTradingBot:
                     signal = self.signal_engine.generate_signal(
                         market_data=md,
                         has_open_position=False,
-                        has_hedge=False
+                        has_hedge=False,
                     )
                     logger.debug(f"{symbol} - Signal: {signal.direction} conf={signal.confidence:.3f}")
                 except Exception as e:
@@ -1012,17 +1025,21 @@ class MultiPairTradingBot:
                     logger.debug(f"{symbol} - SKIPPED: Invalid signal or no direction")
                     continue
 
-                # FINAL CHECK before opening
+                # Fresh exchange snapshot immediately before sizing / open (limits race with other symbols)
                 try:
                     exchange_positions = self.client.get_positions()
-                    final_count = len([p for p in exchange_positions if abs(p.size) > 0.0001])
+                    real_count = len([p for p in exchange_positions if abs(p.size) > 0.0001])
                 except Exception as e:
-                    logger.debug(f"{symbol} - ERROR: Failed to get final position count: {e}")
+                    logger.debug(f"{symbol} - ERROR: Failed to get positions before open: {e}")
                     continue
 
-                if final_count >= max_positions:
-                    logger.debug(f"{symbol} - SKIPPED: Position limit reached ({final_count}/{max_positions})")
+                if real_count >= max_positions:
+                    logger.debug(f"{symbol} - SKIPPED: Position limit reached ({real_count}/{max_positions})")
                     break
+
+                if any(p.symbol == symbol for p in exchange_positions if abs(p.size) > 0.0001):
+                    logger.debug(f"{symbol} - SKIPPED: Position appeared on exchange before open")
+                    continue
 
                 # Calculate position size
                 try:
@@ -1097,6 +1114,11 @@ class MultiPairTradingBot:
                     # Reset API error count on successful operation
                     self.position_tracker._reset_api_error_count(symbol)
                     logger.info(f"Position opened: {symbol} {signal.direction.value}")
+                    try:
+                        exchange_positions = self.client.get_positions()
+                        real_count = len([p for p in exchange_positions if abs(p.size) > 0.0001])
+                    except Exception:
+                        pass
                     # Notify Telegram
                     if hasattr(self, 'telegram_monitor') and self.telegram_monitor:
                         self.telegram_monitor.send_position_opened(
