@@ -69,9 +69,10 @@ class ChampaignEngine:
         )
 
     def _on_close_main(self, stack, mark: float, reason: str) -> None:
-        self.executor.close_main(stack, mark, reason)
+        # Cooldown before close so scan loop cannot re-enter same symbol this tick
         if reason in ("SL", "TP", "MANUAL"):
             self._symbol_cooldown[stack.symbol] = time.time() + self.cfg.symbol_cooldown_sec
+        self.executor.close_main(stack, mark, reason)
 
     def _update_candles(self, symbol: str, candles: List[Candle]) -> None:
         with self._lock:
@@ -135,11 +136,11 @@ class ChampaignEngine:
                 self._fetch_candles(symbol)
             with self._lock:
                 candles = list(self._candles.get(symbol, []))
-            if len(candles) >= 40:
-                self._atr_pct_cache[symbol] = atr_percent(
-                    candles, self.cfg.atr_period
-                )
-                self._atr_updated_at[symbol] = time.time()
+                if len(candles) >= 40:
+                    self._atr_pct_cache[symbol] = atr_percent(
+                        candles, self.cfg.atr_period
+                    )
+                    self._atr_updated_at[symbol] = time.time()
 
     def _pinned_vol_symbols(self) -> List[str]:
         """Always refresh current vol leaders + open stacks (REST every loop)."""
@@ -326,13 +327,15 @@ class ChampaignEngine:
                 self._last_top_vol = self._top_volatile_candidates()
                 leaders = self._vol_leaderboard(5)
                 now = time.time()
+                with self._lock:
+                    atr_vals = list(self._atr_pct_cache.values())
                 if leaders:
                     lead_str = ", ".join(
                         self._format_vol_leader(s, p) for s, p in leaders
                     )
                     above = sum(
                         1
-                        for p in self._atr_pct_cache.values()
+                        for p in atr_vals
                         if p >= self.cfg.champaign_min_atr_pct
                     )
                     sig = f"{leaders[0][0]}:{leaders[0][1]:.3f}"
@@ -347,7 +350,7 @@ class ChampaignEngine:
                             "[CHAMP] Vol leaders: %s | %d/%d >= %.2f%% ATR",
                             lead_str,
                             above,
-                            len(self._atr_pct_cache),
+                            len(atr_vals),
                             self.cfg.champaign_min_atr_pct,
                         )
                 if self._last_top_vol:
@@ -379,7 +382,7 @@ class ChampaignEngine:
                         cash,
                         bal.available_balance,
                         len(self._universe()),
-                        len(self._atr_pct_cache),
+                        len(atr_vals),
                         vol_hint,
                     )
                     self._last_status = now
