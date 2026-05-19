@@ -33,6 +33,7 @@ env.local.ps1
 
 # Runtime / local state (не комітити)
 telegram_chat_id.txt
+data/activity.db
 data/learning.db
 data/learning.db-*
 data/*.db
@@ -40,6 +41,10 @@ data/*.db-shm
 data/*.db-wal
 data/learning_model.json
 data/*model*.json
+data/paper_wallet.json
+data/champaign_state.json
+data/journal.db
+data/models/
 
 # Logs
 *.log

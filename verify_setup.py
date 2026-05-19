@@ -1,111 +1,74 @@
 #!/usr/bin/env python3
-"""
-Verification script to ensure all modules can be imported correctly.
-"""
+"""Check configuration and Binance API connectivity (no trades)."""
+
+from __future__ import annotations
 
 import sys
 
-def verify_imports():
-    """Verify all modules can be imported."""
-    print("=" * 60)
-    print("Self-Learning Trading Bot - Setup Verification")
-    print("=" * 60)
-    
-    modules = [
-        ("config.settings", "Configuration"),
-        ("exchange.binance_client", "Exchange Client"),
-        ("core.market_data", "Market Data"),
-        ("core.feature_engineering", "Feature Engineering"),
-        ("core.pattern_memory", "Pattern Memory"),
-        ("core.signal_engine", "Signal Engine"),
-        ("core.risk_engine", "Risk Engine"),
-        ("core.order_manager", "Order Manager"),
-        ("core.hedge_manager", "Hedge Manager"),
-        ("core.position_tracker", "Position Tracker"),
-        ("ml.model", "ML Models"),
-        ("ml.trainer", "Model Trainer"),
-        ("ml.inference", "Model Inference"),
-        ("utils.websocket_client", "WebSocket Client"),
-    ]
-    
-    success = 0
-    failed = 0
-    
-    for module_name, description in modules:
-        try:
-            __import__(module_name)
-            print(f"[OK] {description:25} ({module_name})")
-            success += 1
-        except ImportError as e:
-            print(f"[FAIL] {description:25} ({module_name}): {e}")
-            failed += 1
-        except Exception as e:
-            print(f"[FAIL] {description:25} ({module_name}): {e}")
-            failed += 1
-    
-    print()
-    print("=" * 60)
-    print(f"Results: {success} passed, {failed} failed")
-    print("=" * 60)
-    
-    if failed > 0:
-        print("\nSome modules failed to import. Please check dependencies:")
-        print("  pip install -r requirements.txt")
-        return False
-    
-    # Additional checks
-    print("\nRunning additional checks...")
-    
-    # Check settings
-    try:
-        from config.settings import get_settings
-        settings = get_settings()
-        print(f"[OK] Settings loaded (symbol: {settings.market_data.symbol})")
-    except Exception as e:
-        print(f"[FAIL] Settings error: {e}")
-        failed += 1
-    
-    # Check ML model can be created
-    try:
-        from ml.model import create_model
-        from core.feature_engineering import FeatureEngine
-        
-        fe = FeatureEngine()
-        model = create_model(fe.feature_dim)
-        param_count = sum(p.numel() for p in model.parameters())
-        print(f"[OK] ML Model created ({param_count:,} parameters)")
-    except Exception as e:
-        print(f"[FAIL] ML Model error: {e}")
-        failed += 1
-    
-    # Check pattern memory DB
-    try:
-        from core.pattern_memory import PatternMemory
-        pm = PatternMemory()
-        count = pm.get_pattern_count()
-        print(f"[OK] Pattern Memory initialized ({count} patterns)")
-    except Exception as e:
-        print(f"[FAIL] Pattern Memory error: {e}")
-        failed += 1
-    
-    print()
-    
-    if failed == 0:
-        print("[OK] All checks passed! Bot is ready to run.")
-        print()
-        print("To start the bot:")
-        print("  python main.py")
-        print("  python main.py --log-level DEBUG")
-        print()
-        print("Make sure to set environment variables:")
-        print("  BINANCE_FUTURES_API_KEY=<your_testnet_key>")
-        print("  BINANCE_FUTURES_API_SECRET=<your_testnet_secret>")
-        return True
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from bot.config import reload_config
+from bot.exchange.client import BinanceFuturesClient
+
+
+def main() -> int:
+    cfg = reload_config()
+    errors = cfg.validate()
+    print("=== Scalper setup check ===\n")
+    print(f"Base URL:     {cfg.base_url}")
+    print(f"Dry run:      {cfg.dry_run}")
+    print(f"Live confirm: {cfg.confirm_live}")
+    print(f"Symbols:      {', '.join(cfg.symbols)}")
+    print(f"Leverage:     {cfg.leverage}x")
+    print(f"API key set:  {'yes' if cfg.api_key else 'NO'}")
+
+    if errors:
+        print("\nConfiguration errors:")
+        for e in errors:
+            print(f"  - {e}")
+        if not cfg.api_key:
+            print("\nHow to create keys (2026):")
+            print("  1. https://www.binance.com/en/binance-api → Create/Manage API Key")
+            print("     (or Profile → API Management)")
+            print("  2. Type: System generated (HMAC) — NOT Ed25519/RSA")
+            print("  3. Permissions: Reading + USD-M Futures; NO Withdrawals")
+            print("  See docs/API_SETUP.md for full guide")
+        return 1
+
+    client = BinanceFuturesClient(cfg)
+    if not client.test_connection():
+        return 1
+
+    client.load_exchange_info()
+    bal = client.get_balance()
+    positions = client.get_positions()
+    print(f"\nBalance:     {bal.available_balance:.2f} USDT available")
+    print(f"Positions:   {len(positions)} open")
+    print(f"Dual mode:   {client.is_dual_side()}")
+    if cfg.telegram_enabled:
+        ok = bool(cfg.telegram_token and cfg.telegram_chat_id)
+        print(f"\nTelegram:     {'configured' if ok else 'ENABLED but missing TOKEN/CHAT_ID'}")
+        if ok:
+            print("  Commands: /status /balance /positions /history /stats")
     else:
-        print(f"[FAIL] {failed} checks failed. Please fix issues before running.")
-        return False
+        print("\nTelegram:     off (TELEGRAM_ENABLED=true)")
+
+    if cfg.dry_run:
+        if cfg.paper_balance > 0:
+            print(f"Paper balance: {cfg.paper_balance:.2f} USDT (PAPER_BALANCE)")
+        elif cfg.paper_use_real_balance_seed:
+            print(f"Paper balance: ~{bal.available_balance:.2f} USDT (from exchange)")
+        else:
+            print(f"Paper balance: {cfg.paper_initial_balance:.2f} USDT (PAPER_INITIAL_BALANCE)")
+        print("\nOK — paper mode: python main.py  (no real trades)")
+    else:
+        print("\nOK — ready to run: python main.py")
+    return 0
 
 
 if __name__ == "__main__":
-    success = verify_imports()
-    sys.exit(0 if success else 1)
+    sys.exit(main())
